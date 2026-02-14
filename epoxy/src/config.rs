@@ -1,20 +1,13 @@
-mod clap_value;
-
 use std::{
     fmt::Debug,
+    fs, io,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs},
     process,
 };
 
-use anyhow::Context;
-use clap::{Parser, ValueEnum};
-use figment::{
-    Figment,
-    providers::{Format, Serialized, Toml},
-};
+use anyhow::{Context, Error};
+use clap::{ArgMatches, CommandFactory, Parser, ValueEnum, parser::ValueSource};
 use serde::{Deserialize, Serialize};
-
-use crate::config::clap_value::ClapValue;
 
 #[derive(Clone, Debug, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +29,16 @@ impl Default for PinPromptKind {
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct ConfigSlice {
+    pub endpoint: Option<String>,
+    pub nssdb_path: Option<String>,
+    pub log: Option<String>,
+    pub max_connections: Option<u8>,
+    pub pin_prompt: Option<PinPromptKind>,
+    pub allow_soft_tokens: Option<bool>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Config {
     pub endpoint: String,
@@ -55,6 +58,19 @@ impl Default for Config {
             max_connections: 2,
             pin_prompt: PinPromptKind::default(),
             allow_soft_tokens: false,
+        }
+    }
+}
+
+impl Config {
+    fn merge(self, slice: ConfigSlice) -> Config {
+        Config {
+            endpoint: slice.endpoint.unwrap_or(self.endpoint),
+            nssdb_path: slice.nssdb_path.unwrap_or(self.nssdb_path),
+            log: slice.log.unwrap_or(self.log),
+            max_connections: slice.max_connections.unwrap_or(self.max_connections),
+            pin_prompt: slice.pin_prompt.unwrap_or(self.pin_prompt),
+            allow_soft_tokens: slice.allow_soft_tokens.unwrap_or(self.allow_soft_tokens),
         }
     }
 }
@@ -92,55 +108,80 @@ fn default_config_path() -> String {
 pub struct ClapConfig {
     /// Path to an optional config file
     #[serde(skip)]
-    #[clap(short = 'c', long, default_value_t = default_config_path())]
+    #[arg(short = 'c', long, default_value_t = default_config_path())]
     config_path: String,
 
     /// IP:Port or `tokio-listener` address to use. Ports supported by ePorezi: 17165, 20806, 65097
-    #[clap(short = 'e', long, default_value_t = ClapValue::default(Config::default().endpoint))]
-    endpoint: ClapValue<String>,
+    #[arg(short = 'e', long, default_value_t = Config::default().endpoint)]
+    endpoint: String,
 
     /// Path to an NSS database
-    #[clap(short = 'd', long, default_value_t = ClapValue::default(Config::default().nssdb_path))]
-    nssdb_path: ClapValue<String>,
+    #[arg(short = 'd', long, default_value_t = Config::default().nssdb_path)]
+    nssdb_path: String,
 
     /// Logging directives (see https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html#directives)
-    #[clap(short = 'l', long, default_value_t = ClapValue::default(Config::default().log))]
-    log: ClapValue<String>,
+    #[arg(short = 'l', long, default_value_t = Config::default().log)]
+    log: String,
 
     /// Max accepted connections
-    #[clap(long, default_value_t = ClapValue::default(Config::default().max_connections))]
-    max_connections: ClapValue<u8>,
+    #[arg(long, default_value_t = Config::default().max_connections)]
+    max_connections: u8,
 
     /// PIN prompt method
-    #[clap(long, value_enum, default_value_t = ClapValue::default(Config::default().pin_prompt))]
-    pin_prompt: ClapValue<PinPromptKind>,
+    #[arg(long, value_enum, default_value_t = Config::default().pin_prompt)]
+    pin_prompt: PinPromptKind,
 
-    #[clap(long, default_value_t = ClapValue::default(Config::default().allow_soft_tokens))]
+    #[arg(long, default_value_t = Config::default().allow_soft_tokens)]
     /// Include certificates from software PKCS#11 tokens for testing
-    allow_soft_tokens: ClapValue<bool>,
+    allow_soft_tokens: bool,
 
     /// Print default config
     #[serde(skip)]
-    #[clap(long, default_value_t = false)]
+    #[arg(long, default_value_t = false)]
     print_config: bool,
 }
 
+fn get_cli_value<T>(matches: &ArgMatches, name: &'static str) -> Option<T>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    if matches.value_source(name) != Some(ValueSource::CommandLine) {
+        return None;
+    }
+    matches.get_one(name).cloned()
+}
+
 pub fn get_config() -> Result<Config, anyhow::Error> {
-    let clap_config = ClapConfig::parse();
-    if clap_config.print_config {
-        println!("{}", toml::to_string_pretty(&clap_config)?);
+    let default_config = Config::default();
+
+    let ClapConfig {
+        config_path,
+        print_config,
+        ..
+    } = ClapConfig::parse();
+
+    if print_config {
+        println!("{}", toml::to_string_pretty(&default_config)?);
         process::exit(0);
     }
 
-    let config_path = clap_config.config_path.clone();
+    let toml_slice = match fs::read(config_path) {
+        Ok(bytes) => toml::from_slice(&bytes).context("invalid config file"),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(ConfigSlice::default()),
+        Err(e) => Err(Error::new(e).context("failed to read config file")),
+    }?;
 
-    let builtin_defaults = Serialized::defaults(Config::default());
-    let provided_args = Serialized::defaults(clap_config);
-    let config_file = Toml::file(config_path);
+    let matches = ClapConfig::command().get_matches();
+    let cli_slice = ConfigSlice {
+        endpoint: get_cli_value(&matches, "endpoint"),
+        nssdb_path: get_cli_value(&matches, "nssdb_path"),
+        log: get_cli_value(&matches, "log"),
+        max_connections: get_cli_value(&matches, "max_connections"),
+        pin_prompt: get_cli_value(&matches, "pin_prompt"),
+        allow_soft_tokens: get_cli_value(&matches, "allow_soft_tokens"),
+    };
 
-    Figment::from(builtin_defaults)
-        .merge(provided_args)
-        .merge(config_file)
-        .extract()
-        .context("failed to extract config")
+    let config = default_config.merge(toml_slice).merge(cli_slice);
+
+    Ok(config)
 }
