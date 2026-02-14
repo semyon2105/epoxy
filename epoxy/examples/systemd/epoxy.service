@@ -1,0 +1,22 @@
+[Unit]
+Description=SmartBox-compatible open source tool for signing ePorezi tax forms
+After=network.target
+Requires=epoxy.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/epoxy --endpoint sd-listen
+Restart=on-failure
+RestartSec=10s
+KillMode=mixed
+
+# Limits
+LimitNOFILE=256
+TasksMax=64
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=graphical.target
