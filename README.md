@@ -30,6 +30,7 @@ Only Linux systems are currently supported.
 - `libnss3`
 - `libxml2`
 - `libxmlsec1`
+- `gtk4` (for `ui-gtk4` feature)
 
 ### Install PKCS#11 module
 
@@ -93,7 +94,7 @@ epoxy --help
 
 ### Systemd service
 
-Example systemd unit files can be found [here](epoxy/examples/systemd).
+Systemd unit files can be found [here](epoxy/systemd).
 
 ```
 systemctl --user enable epoxy.socket
@@ -106,4 +107,4 @@ For testing, use the [ePorezi test environment](https://test.purs.gov.rs). The O
 
 **DO NOT enter your PIN on the ePorezi login page**. As of 2026-02-14, PINs are being leaked to ePorezi servers.
 
-![demo](epoxy/examples/demo.gif)
+![demo](assets/demo.gif)

@@ -1,13 +1,13 @@
 [Unit]
+ConditionUser=!root
 Description=SmartBox-compatible open source tool for signing ePorezi tax forms - Socket
-PartOf=epoxy.service
 
 [Socket]
 ListenStream=[::1]:17165
 Accept=no
 NoDelay=true
-MaxConnections=10
-Backlog=10
+MaxConnections=4
+Backlog=4
 
 [Install]
 WantedBy=sockets.target
