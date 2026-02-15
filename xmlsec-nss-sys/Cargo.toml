@@ -3,5 +3,8 @@ name = "xmlsec-nss-sys"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+doctest = false
+
 [build-dependencies]
 bindgen = "0.72"

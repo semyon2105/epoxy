@@ -1,4 +1,5 @@
 [Unit]
+ConditionUser=!root
 Description=SmartBox-compatible open source tool for signing ePorezi tax forms
 After=network.target
 Requires=epoxy.socket
@@ -15,8 +16,12 @@ LimitNOFILE=256
 TasksMax=64
 
 # Hardening
-NoNewPrivileges=true
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+NoNewPrivileges=yes
 ProtectSystem=strict
+SystemCallArchitectures=native
 
 [Install]
+Also=epoxy.socket
 WantedBy=graphical.target
