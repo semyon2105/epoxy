@@ -137,16 +137,19 @@ async fn get_sockaddr_listener(endpoint: &str) -> Result<TcpListener> {
 
 fn serve<'a>(
     max_connections: u8,
-    max_idle_seconds: u64,
+    max_idle_seconds: u32,
     listener: TcpListener,
     server: Rc<Server<'a>>,
 ) -> LocalBoxFuture<'a, ()> {
-    let timeout = if max_idle_seconds == 0 {
-        Duration::MAX
-    } else {
-        Duration::from_secs(max_idle_seconds)
-    };
+    if max_idle_seconds == 0 {
+        return TcpListenerStream::new(listener)
+            .map(move |conn| handle_conn(server.clone(), conn))
+            .buffer_unordered(max_connections as usize)
+            .collect::<()>()
+            .boxed_local()
+    }
 
+    let timeout = Duration::from_secs(max_idle_seconds as u64);
     let idle_debouncer = Debouncer::new(timeout, DebounceMode::Trailing);
     idle_debouncer.trigger();
 
