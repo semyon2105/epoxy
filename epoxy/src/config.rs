@@ -30,7 +30,7 @@ struct ConfigSlice {
     pub nssdb_path: Option<String>,
     pub log: Option<String>,
     pub max_connections: Option<u8>,
-    pub max_idle_seconds: Option<u64>,
+    pub max_idle_seconds: Option<u32>,
     pub pin_prompt: Option<PinPromptKind>,
     pub allow_soft_tokens: Option<bool>,
 }
@@ -41,7 +41,7 @@ pub struct Config {
     pub nssdb_path: String,
     pub log: String,
     pub max_connections: u8,
-    pub max_idle_seconds: u64,
+    pub max_idle_seconds: u32,
     pub pin_prompt: PinPromptKind,
     pub allow_soft_tokens: bool,
 }
@@ -117,7 +117,7 @@ pub struct ClapConfig {
 
     /// Shut down if idle for this duration (no new connections accepted)
     #[arg(long, default_value_t = Config::default().max_idle_seconds)]
-    max_idle_seconds: u64,
+    max_idle_seconds: u32,
 
     /// PIN prompt method
     #[arg(long, value_enum, default_value_t = Config::default().pin_prompt)]
