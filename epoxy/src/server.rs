@@ -13,7 +13,7 @@ use libxml::{
 };
 use tokio::net::TcpStream;
 use tokio_tungstenite::WebSocketStream;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use tungstenite::{Message, Utf8Bytes};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
@@ -283,6 +283,11 @@ impl<'a> Server<'a> {
                     // keep only signing certs
                     let key_usage = x509.key_usage().ok()??.value;
                     if !(key_usage.digital_signature() && key_usage.non_repudiation()) {
+                        return None;
+                    }
+
+                    if !x509.validity().is_valid() {
+                        warn!("certificate \"{label}\" is either expired or not yet active");
                         return None;
                     }
 
