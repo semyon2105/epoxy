@@ -15,13 +15,13 @@ hex = "0.4"
 libxml = "0.3"
 oneshot = { version = "0.1", optional = true }
 rpassword = "7.4"
+sd-notify = { version = "0.4", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_repr = "0.1"
 serde_with = { version = "3.16", features = ["base64"] }
 thiserror = "2.0"
 tokio = { version = "1.49", features = ["macros", "rt"] }
-tokio-listener = { version = "0.5" }
 tokio-stream = { version = "0.1", features = ["net"] }
 tokio-tungstenite = "0.28"
 toml = "0.9"
@@ -33,5 +33,6 @@ x509-parser = "0.18"
 xmlsec-nss-sys = { path = "../xmlsec-nss-sys" }
 
 [features]
-default = ["ui-gtk"]
+default = ["systemd", "ui-gtk"]
+systemd = ["dep:sd-notify"]
 ui-gtk = ["dep:gtk4", "dep:oneshot"]

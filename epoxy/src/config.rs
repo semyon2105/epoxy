@@ -1,7 +1,6 @@
 use std::{
     fmt::Debug,
     fs, io,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs},
     process,
 };
 
@@ -52,7 +51,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            endpoint: default_localhost_addr(),
+            endpoint: String::from("localhost:17165"),
             nssdb_path: default_nssdb_path(),
             log: String::from("info"),
             max_connections: 2,
@@ -73,17 +72,6 @@ impl Config {
             allow_soft_tokens: slice.allow_soft_tokens.unwrap_or(self.allow_soft_tokens),
         }
     }
-}
-
-// handle dual-stack case, fall back to IPv4
-fn default_localhost_addr() -> String {
-    let fallback_v4 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 17165));
-    "localhost:17165"
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut addrs| addrs.next())
-        .unwrap_or(fallback_v4)
-        .to_string()
 }
 
 fn default_nssdb_path() -> String {
@@ -111,7 +99,7 @@ pub struct ClapConfig {
     #[arg(short = 'c', long, default_value_t = default_config_path())]
     config_path: String,
 
-    /// IP:Port or `tokio-listener` address to use. Ports supported by ePorezi: 17165, 20806, 65097
+    /// Endpoint to listen on. Ports supported by ePorezi: 17165, 20806, 65097
     #[arg(short = 'e', long, default_value_t = Config::default().endpoint)]
     endpoint: String,
 

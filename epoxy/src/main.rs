@@ -9,7 +9,7 @@ mod xmlsec;
 
 use std::{rc::Rc, str::FromStr, sync::Arc};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use futures::{
     FutureExt, StreamExt,
     future::{self, LocalBoxFuture},
@@ -19,7 +19,6 @@ use tokio::{
     io,
     net::{TcpListener, TcpStream},
 };
-use tokio_listener::{Listener, SystemOptions, UserOptions};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_tungstenite::accept_async;
 use tracing::{info, trace, warn};
@@ -56,7 +55,6 @@ async fn main() -> Result<()> {
         allow_soft_tokens: config.allow_soft_tokens,
     };
     let server = Rc::new(Server::new(server_config, pin_context, nss, xmlsec));
-
     let server_fut = serve(config.max_connections, listener, server);
 
     match pin_prompt_fut {
@@ -111,22 +109,48 @@ fn ui_pin_prompt() -> PinPromptStack {
 }
 
 async fn get_listener(endpoint: String) -> Result<TcpListener> {
-    let listener_addr = endpoint
-        .parse()
-        .map_err(|e| anyhow!("invalid endpoint: {e}"))?;
-    let system_opts = SystemOptions::default();
-    let user_opts = UserOptions::default();
-
-    let listener = Listener::bind(&listener_addr, &system_opts, &user_opts)
-        .await
-        .context(format!("failed to bind to {}", endpoint))?
-        .try_into_tcp_listener()
-        .map_err(|_| anyhow!("{endpoint} is not a TCP socket"))?;
-
-    match listener.local_addr() {
-        Ok(socket_addr) => info!("listening on {}", socket_addr),
-        Err(_) => info!("listening on {}", endpoint),
+    match endpoint.as_ref() {
+        "sd-listen" => get_fd_listener(),
+        endpoint => get_sockaddr_listener(endpoint).await,
     }
+}
+
+#[cfg(feature = "systemd")]
+fn get_fd_listener() -> Result<TcpListener> {
+    use anyhow::anyhow;
+    use sd_notify::NotifyState;
+    use std::os::fd::FromRawFd;
+
+    let fd = sd_notify::listen_fds()
+        .context("missing fds")?
+        .next()
+        .ok_or(anyhow!("missing fd"))?;
+
+    let listener = TcpListener::from_std(unsafe { std::net::TcpListener::from_raw_fd(fd) })
+        .context("failed to create listener from fd")?;
+
+    let socket_addr = listener.local_addr().context("failed to get socket addr")?;
+    info!("listening on {socket_addr} (fd {fd})");
+
+    sd_notify::notify(true, &[NotifyState::Ready]).context("sd_notify failed")?;
+
+    Ok(listener)
+}
+
+#[cfg(not(feature = "systemd"))]
+fn get_fd_listener() -> Result<TcpListener> {
+    use anyhow::anyhow;
+
+    Err(anyhow!("cannot listen on fd: \"systemd\" feature is disabled"))
+}
+
+async fn get_sockaddr_listener(endpoint: &str) -> Result<TcpListener> {
+    let listener = TcpListener::bind(endpoint)
+        .await
+        .context(format!("failed to listen on {}", endpoint))?;
+
+    let socket_addr = listener.local_addr().context("failed to get socket addr")?;
+    info!("listening on {socket_addr}");
 
     Ok(listener)
 }
