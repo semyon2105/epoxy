@@ -5,8 +5,9 @@ After=network.target
 Requires=epoxy.socket
 
 [Service]
-Type=simple
-ExecStart=/usr/bin/epoxy --endpoint sd-listen
+Type=notify
+ExecStart=/usr/bin/epoxy --endpoint sd-listen --max-idle-seconds 600
+NonBlocking=yes
 Restart=on-failure
 RestartSec=10s
 KillMode=mixed

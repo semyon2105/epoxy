@@ -1,30 +1,51 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use futures::FutureExt;
 use gtk4::gio::prelude::*;
 use gtk4::glib::{ExitCode, clone};
 use gtk4::{
-    Application, Box, Button, Label, Orientation, PasswordEntry, Separator, Window, glib,
+    Application, Box as GBox, Button, Label, Orientation, PasswordEntry, Separator, Window, glib,
     prelude::*,
 };
 use tokio::sync::mpsc;
+use tokio::task;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
-use crate::pin::{PinInfo, PinPrompt};
+use crate::pin::{PinInfo, PinMethod, PinPrompt};
 
-pub fn run(app_id: &str, pin_rx: mpsc::Receiver<PinChannelMessage>) -> ExitCode {
+pub fn ui_pin_method(ct: CancellationToken) -> PinMethod {
+    let app_id = "dev.semyon.epoxy";
+    let (pin_tx, pin_rx) = mpsc::channel(1);
+    let ui_fut = task::spawn_blocking(|| run_ui(app_id, pin_rx, ct)).map(|result| match result {
+        Ok(exit_code) if exit_code.get() != 0 => {
+            error!("UI exited with code {}", exit_code.get())
+        }
+        Ok(_) => {
+            debug!("UI exited with code 0")
+        }
+        Err(e) => {
+            error!("UI exited with error: {e}")
+        }
+    });
+    (Box::new(pin_tx), ui_fut.boxed_local())
+}
+
+fn run_ui(
+    app_id: &str,
+    pin_rx: mpsc::Receiver<PinChannelMessage>,
+    ct: CancellationToken,
+) -> ExitCode {
     let app = Application::builder().application_id(app_id).build();
 
     let pin_rx_cell = RefCell::new(Some(pin_rx));
-    let app_holder = RefCell::new(None);
+    let app_holder = Rc::new(RefCell::new(None));
 
     app.connect_activate(move |app| {
-        let pin_rx = pin_rx_cell.take();
-        let Some(mut pin_rx) = pin_rx else {
-            error!("failed to establish PIN channel");
-            return;
-        };
-
+        let mut pin_rx = pin_rx_cell
+            .take()
+            .expect("GTK 'activate' called more than once");
         glib::spawn_future_local(clone!(
             #[weak]
             app,
@@ -35,8 +56,19 @@ pub fn run(app_id: &str, pin_rx: mpsc::Receiver<PinChannelMessage>) -> ExitCode 
             }
         ));
 
-        // do not let UI thread exit
+        // do not let UI thread exit on its own
         app_holder.replace(Some(app.hold()));
+
+        glib::spawn_future_local(clone!(
+            #[strong]
+            ct,
+            #[strong]
+            app_holder,
+            async move {
+                ct.cancelled().await;
+                app_holder.replace(None);
+            }
+        ));
 
         debug!("UI initialized");
     });
@@ -66,7 +98,7 @@ fn new_pin_popup(app: &Application, pin_info: PinInfo, token_name: String, reply
 
     let cancel_button = Button::builder().label("Cancel").width_request(108).build();
 
-    let button_box = Box::builder()
+    let button_box = GBox::builder()
         .orientation(Orientation::Horizontal)
         .halign(gtk4::Align::End)
         .spacing(12)
@@ -75,7 +107,7 @@ fn new_pin_popup(app: &Application, pin_info: PinInfo, token_name: String, reply
     button_box.append(&ok_button);
     button_box.append(&cancel_button);
 
-    let content_box = Box::builder()
+    let content_box = GBox::builder()
         .orientation(Orientation::Vertical)
         .margin_start(12)
         .margin_end(12)
@@ -133,16 +165,9 @@ fn new_pin_popup(app: &Application, pin_info: PinInfo, token_name: String, reply
     window.present();
 }
 
-pub type PinReply = oneshot::Sender<Option<String>>;
+type PinReply = oneshot::Sender<Option<String>>;
 
-pub type PinChannelMessage = (PinInfo, String, PinReply);
-
-pub fn new_pin_channel() -> (
-    mpsc::Sender<PinChannelMessage>,
-    mpsc::Receiver<PinChannelMessage>,
-) {
-    mpsc::channel(1)
-}
+type PinChannelMessage = (PinInfo, String, PinReply);
 
 impl PinPrompt for mpsc::Sender<PinChannelMessage> {
     fn prompt_pin(&self, pin_info: PinInfo, token_name: String) -> Option<String> {
