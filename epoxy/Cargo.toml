@@ -22,8 +22,10 @@ serde_repr = "0.1"
 serde_with = { version = "3.16", features = ["base64"] }
 thiserror = "2.0"
 tokio = { version = "1.49", features = ["macros", "rt"] }
+tokio-debouncer = "0.3"
 tokio-stream = { version = "0.1", features = ["net"] }
 tokio-tungstenite = "0.28"
+tokio-util = "0.7"
 toml = "0.9"
 tracing = "0.1"
 tracing-log = "0.2"

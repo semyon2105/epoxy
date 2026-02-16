@@ -6,8 +6,7 @@ Description=SmartBox-compatible open source tool for signing ePorezi tax forms -
 ListenStream=[::1]:17165
 Accept=no
 NoDelay=true
-MaxConnections=4
-Backlog=4
+MaxConnections=10
 
 [Install]
 WantedBy=sockets.target

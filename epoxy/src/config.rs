@@ -1,8 +1,4 @@
-use std::{
-    fmt::Debug,
-    fs, io,
-    process,
-};
+use std::{fmt::Debug, fs, io, process};
 
 use anyhow::{Context, Error};
 use clap::{ArgMatches, CommandFactory, Parser, ValueEnum, parser::ValueSource};
@@ -34,6 +30,7 @@ struct ConfigSlice {
     pub nssdb_path: Option<String>,
     pub log: Option<String>,
     pub max_connections: Option<u8>,
+    pub max_idle_seconds: Option<u64>,
     pub pin_prompt: Option<PinPromptKind>,
     pub allow_soft_tokens: Option<bool>,
 }
@@ -44,6 +41,7 @@ pub struct Config {
     pub nssdb_path: String,
     pub log: String,
     pub max_connections: u8,
+    pub max_idle_seconds: u64,
     pub pin_prompt: PinPromptKind,
     pub allow_soft_tokens: bool,
 }
@@ -54,7 +52,8 @@ impl Default for Config {
             endpoint: String::from("localhost:17165"),
             nssdb_path: default_nssdb_path(),
             log: String::from("info"),
-            max_connections: 2,
+            max_connections: 10,
+            max_idle_seconds: 0,
             pin_prompt: PinPromptKind::default(),
             allow_soft_tokens: false,
         }
@@ -68,6 +67,7 @@ impl Config {
             nssdb_path: slice.nssdb_path.unwrap_or(self.nssdb_path),
             log: slice.log.unwrap_or(self.log),
             max_connections: slice.max_connections.unwrap_or(self.max_connections),
+            max_idle_seconds: slice.max_idle_seconds.unwrap_or(self.max_idle_seconds),
             pin_prompt: slice.pin_prompt.unwrap_or(self.pin_prompt),
             allow_soft_tokens: slice.allow_soft_tokens.unwrap_or(self.allow_soft_tokens),
         }
@@ -114,6 +114,10 @@ pub struct ClapConfig {
     /// Max accepted connections
     #[arg(long, default_value_t = Config::default().max_connections)]
     max_connections: u8,
+
+    /// Shut down if idle for this duration (no new connections accepted)
+    #[arg(long, default_value_t = Config::default().max_idle_seconds)]
+    max_idle_seconds: u64,
 
     /// PIN prompt method
     #[arg(long, value_enum, default_value_t = Config::default().pin_prompt)]
@@ -165,6 +169,7 @@ pub fn get_config() -> Result<Config, anyhow::Error> {
         nssdb_path: get_cli_value(&matches, "nssdb_path"),
         log: get_cli_value(&matches, "log"),
         max_connections: get_cli_value(&matches, "max_connections"),
+        max_idle_seconds: get_cli_value(&matches, "max_idle_seconds"),
         pin_prompt: get_cli_value(&matches, "pin_prompt"),
         allow_soft_tokens: get_cli_value(&matches, "allow_soft_tokens"),
     };

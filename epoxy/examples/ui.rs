@@ -1,32 +1,30 @@
 //! Open PIN dialog with mock data
 
-use std::thread;
-
-use anyhow::{Context, Error};
+use anyhow::Error;
 use epoxy::{pin::PinInfo, ui};
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-fn main() -> Result<(), Error> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Error> {
     tracing_subscriber::fmt::init();
 
-    let (tx, rx) = ui::new_pin_channel();
-    let (reply_tx, reply_rx) = oneshot::channel();
+    let pin_method_ct = CancellationToken::new();
+    let (pin_prompt, pin_method_fut) = ui::ui_pin_method(pin_method_ct.clone());
 
     let pin_info = PinInfo {
         cert: Some("John Doe 012345678 Sign".into()),
         reason: "Sign form (unidentified)".into(),
     };
-
     let token_name = "My Token".into();
 
-    tx.blocking_send((pin_info, token_name, reply_tx))
-        .context("failed to send PIN request")?;
+    let pin = pin_prompt.prompt_pin(pin_info, token_name);
 
-    thread::spawn(|| ui::run("dev.semyon.epoxy.test", rx));
-
-    let pin = reply_rx.recv().context("failed to receive PIN")?;
     let masked_pin = pin.map(|p| str::repeat("*", p.len()));
     info!("received PIN: {:?}", masked_pin);
+
+    pin_method_ct.cancel();
+    pin_method_fut.await;
 
     Ok(())
 }

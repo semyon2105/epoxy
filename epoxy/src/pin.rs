@@ -1,8 +1,19 @@
+use futures::{
+    FutureExt,
+    future::{self, LocalBoxFuture},
+};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
 use crate::nss::PinCallback;
+
+pub type PinMethod = (Box<dyn PinPrompt>, LocalBoxFuture<'static, ()>);
+
+pub fn tty_pin_method(_: CancellationToken) -> PinMethod {
+    (Box::new(TtyPinPrompt), future::pending().boxed_local())
+}
 
 #[derive(Debug, Clone)]
 pub struct PinInfo {

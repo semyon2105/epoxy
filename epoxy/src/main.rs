@@ -7,27 +7,25 @@ mod server;
 mod ui;
 mod xmlsec;
 
-use std::{rc::Rc, str::FromStr, sync::Arc};
+use std::{io, rc::Rc, str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
-use futures::{
-    FutureExt, StreamExt,
-    future::{self, LocalBoxFuture},
-};
-use pin::PinPrompt;
+use futures::{FutureExt, StreamExt, future::LocalBoxFuture};
 use tokio::{
-    io,
     net::{TcpListener, TcpStream},
+    select,
 };
+use tokio_debouncer::{DebounceMode, Debouncer};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_tungstenite::accept_async;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, trace, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::{
     config::{PinPromptKind, get_config},
     nss::{Nss, NssGlobals},
-    pin::{PinContext, PinProvider},
+    pin::{PinContext, PinMethod, PinProvider, tty_pin_method},
     server::{Server, ServerConfig},
     xmlsec::XmlSec,
 };
@@ -41,7 +39,8 @@ async fn main() -> Result<()> {
 
     let listener = get_listener(config.endpoint).await?;
 
-    let (pin_prompt, pin_prompt_fut) = get_pin_prompt(config.pin_prompt);
+    let pin_method_ct = CancellationToken::new();
+    let (pin_prompt, pin_method_fut) = get_pin_method(config.pin_prompt, pin_method_ct.clone());
     let pin_context = Arc::new(PinContext::default());
     let pin_provider = Box::new(PinProvider::new(pin_context.clone(), pin_prompt));
 
@@ -55,16 +54,17 @@ async fn main() -> Result<()> {
         allow_soft_tokens: config.allow_soft_tokens,
     };
     let server = Rc::new(Server::new(server_config, pin_context, nss, xmlsec));
-    let server_fut = serve(config.max_connections, listener, server);
+    let server_fut = serve(
+        config.max_connections,
+        config.max_idle_seconds,
+        listener,
+        server,
+    );
 
-    match pin_prompt_fut {
-        None => {
-            server_fut.await;
-        }
-        Some(pin_prompt_fut) => {
-            future::select_all([server_fut, pin_prompt_fut]).await;
-        }
-    };
+    select! {
+        _ = server_fut => pin_method_ct.cancel(),
+        _ = pin_method_fut => (),
+    }
 
     Ok(())
 }
@@ -75,37 +75,15 @@ fn init_tracing(log_spec: &str) -> Result<()> {
     Ok(())
 }
 
-type PinPromptStack = (Box<dyn PinPrompt>, Option<LocalBoxFuture<'static, ()>>);
+fn get_pin_method(pin_prompt: PinPromptKind, ct: CancellationToken) -> PinMethod {
+    #[cfg(feature = "ui-gtk")]
+    use crate::ui::ui_pin_method;
 
-fn get_pin_prompt(pin_prompt: PinPromptKind) -> PinPromptStack {
     match pin_prompt {
-        config::PinPromptKind::Tty => (Box::new(pin::TtyPinPrompt), None),
+        config::PinPromptKind::Tty => tty_pin_method(ct),
         #[cfg(feature = "ui-gtk")]
-        config::PinPromptKind::Ui => ui_pin_prompt(),
+        config::PinPromptKind::Ui => ui_pin_method(ct),
     }
-}
-
-#[cfg(feature = "ui-gtk")]
-fn ui_pin_prompt() -> PinPromptStack {
-    use futures::FutureExt;
-    use tokio::task;
-    use tracing::{debug, error};
-
-    let app_id = "dev.semyon.epoxy";
-    let (pin_tx, pin_rx) = ui::new_pin_channel();
-    let pin_prompt = Box::new(pin_tx);
-    let ui_fut = task::spawn_blocking(|| ui::run(app_id, pin_rx)).map(|result| match result {
-        Ok(exit_code) if exit_code.get() != 0 => {
-            error!("UI exited with code {}", exit_code.get())
-        }
-        Ok(_) => {
-            debug!("UI exited with code 0")
-        }
-        Err(e) => {
-            error!("UI exited with error: {e}")
-        }
-    });
-    (pin_prompt, Some(ui_fut.boxed_local()))
 }
 
 async fn get_listener(endpoint: String) -> Result<TcpListener> {
@@ -141,7 +119,9 @@ fn get_fd_listener() -> Result<TcpListener> {
 fn get_fd_listener() -> Result<TcpListener> {
     use anyhow::anyhow;
 
-    Err(anyhow!("cannot listen on fd: \"systemd\" feature is disabled"))
+    Err(anyhow!(
+        "cannot listen on fd: \"systemd\" feature is disabled"
+    ))
 }
 
 async fn get_sockaddr_listener(endpoint: &str) -> Result<TcpListener> {
@@ -157,20 +137,46 @@ async fn get_sockaddr_listener(endpoint: &str) -> Result<TcpListener> {
 
 fn serve<'a>(
     max_connections: u8,
+    max_idle_seconds: u64,
     listener: TcpListener,
     server: Rc<Server<'a>>,
 ) -> LocalBoxFuture<'a, ()> {
-    TcpListenerStream::new(listener)
-        .map(move |conn| handle_conn(server.clone(), conn))
+    let timeout = if max_idle_seconds == 0 {
+        Duration::MAX
+    } else {
+        Duration::from_secs(max_idle_seconds)
+    };
+
+    let idle_debouncer = Debouncer::new(timeout, DebounceMode::Trailing);
+    idle_debouncer.trigger();
+
+    let server_fut = TcpListenerStream::new(listener)
+        .map({
+            let idle_debouncer = idle_debouncer.clone();
+            move |conn| {
+                idle_debouncer.clone().trigger();
+                handle_conn(server.clone(), conn)
+            }
+        })
         .buffer_unordered(max_connections as usize)
-        .collect::<()>()
-        .boxed_local()
+        .collect::<()>();
+
+    async move {
+        select! {
+            _ = idle_debouncer.ready() => info!("no new connections accepted within {max_idle_seconds} seconds, shutting down..."),
+            _ = server_fut => (),
+        }
+    }
+    .boxed_local()
 }
 
 async fn handle_conn<'a>(server: Rc<Server<'a>>, conn: Result<TcpStream, io::Error>) {
-    let Ok(stream) = conn else {
-        warn!("failed to accept connection");
-        return;
+    let stream = match conn {
+        Ok(stream) => stream,
+        Err(e) => {
+            warn!("failed to accept connection: {e}");
+            return;
+        }
     };
 
     let Ok(peer_addr) = stream.peer_addr() else {
@@ -179,18 +185,18 @@ async fn handle_conn<'a>(server: Rc<Server<'a>>, conn: Result<TcpStream, io::Err
     };
 
     let Ok(ws_stream) = accept_async(stream).await else {
-        warn!("failed to accept connection: WebSocket handshake error");
+        warn!("failed to accept connection from {peer_addr}: WebSocket handshake error");
         return;
     };
 
-    info!("connection accepted: {}", peer_addr);
+    info!("connection accepted: {peer_addr}");
 
     match server.run(ws_stream).await {
         Ok(()) => {
             info!("connection closed: {peer_addr}");
         }
         Err(e) => {
-            warn!("connection terminated: {e}")
+            warn!("connection terminated: {peer_addr} {e}")
         }
     }
 }
