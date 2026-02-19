@@ -1,8 +1,6 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, hash_map::Entry},
-    rc::Rc,
-    sync::Arc,
 };
 
 use anyhow::{Context, Error, Result, anyhow};
@@ -19,7 +17,7 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::{
     nss::{Nss, SecItem, TokenUri},
-    pin::{PinContext, PinInfo},
+    pin::{PinContext, PinInfo, PinPrompt},
     proto::{
         requests::{self, Request},
         responses::{self, Response, ResultResponse, SuccessResponse},
@@ -60,7 +58,7 @@ impl TryFrom<Message> for Request {
 pub struct Session {
     providers_map: HashMap<i32, &'static str>,
     terminals_map: HashMap<i32, TokenUri>,
-    certs_map: HashMap<String, (SecItem, String)>,
+    certs_map: HashMap<String, (TokenUri, SecItem, String)>,
 }
 
 impl Session {
@@ -81,25 +79,25 @@ pub struct ServerConfig {
     pub allow_soft_tokens: bool,
 }
 
-pub struct Server<'a> {
+pub struct Server {
     config: ServerConfig,
-    pin_context: Arc<PinContext>,
-    nss: Rc<Nss<'a>>,
+    pin_prompt: Box<dyn PinPrompt>,
+    nss: Nss,
     xml_parser: Parser,
-    xmlsec: XmlSec<'a>,
+    xmlsec: XmlSec,
     sessions: RefCell<HashMap<String, Session>>,
 }
 
-impl<'a> Server<'a> {
+impl Server {
     pub fn new(
         config: ServerConfig,
-        pin_context: Arc<PinContext>,
-        nss: Rc<Nss<'a>>,
-        xmlsec: XmlSec<'a>,
-    ) -> Server<'a> {
+        pin_prompt: Box<dyn PinPrompt>,
+        nss: Nss,
+        xmlsec: XmlSec,
+    ) -> Server {
         Server {
             config,
-            pin_context,
+            pin_prompt,
             nss,
             xml_parser: Parser::default(),
             xmlsec,
@@ -227,6 +225,10 @@ impl<'a> Server<'a> {
         _request: requests::GetTerminals,
     ) -> ResultResponse<responses::GetTerminals, responses::GetTerminalsErrorCode> {
         let tokens = self.nss.get_tokens();
+        let Some(tokens) = tokens else {
+            return ResultResponse::error(responses::GetTerminalsErrorCode::GenericError);
+        };
+
         let valid_tokens = tokens.into_iter().filter_map(|token| {
             if (self.config.allow_soft_tokens || token.is_hw()) && !token.is_internal() {
                 Some((token.uri(), token.name()))
@@ -259,42 +261,42 @@ impl<'a> Server<'a> {
             return ResultResponse::error(responses::GetCertificatesErrorCode::GenericError);
         };
 
-        let valid_certs = {
-            // here PIN will be requested only if the token doesn't allow passwordless access to certs
-            let pin_info = PinInfo {
-                cert: None,
-                reason: "List certificates".into(),
-            };
-            let Ok(_guard) = self.pin_context.with_pin_info(pin_info) else {
-                return ResultResponse::error(responses::GetCertificatesErrorCode::GenericError);
-            };
-
-            self.nss
-                .get_certs_in_token(token_uri)
-                .into_iter()
-                .filter_map(|cert| {
-                    let der = cert.der();
-                    let thumbprint = blake3::hash(der.as_ref()).to_string();
-
-                    let (_, x509) = X509Certificate::from_der(der.as_ref()).ok()?;
-                    let common_name = x509.subject().iter_common_name().next()?;
-                    let label = common_name.as_str().ok()?.to_owned();
-
-                    // keep only signing certs
-                    let key_usage = x509.key_usage().ok()??.value;
-                    if !(key_usage.digital_signature() && key_usage.non_repudiation()) {
-                        return None;
-                    }
-
-                    if !x509.validity().is_valid() {
-                        warn!("certificate \"{label}\" is either expired or not yet active");
-                        return None;
-                    }
-
-                    Some((der, thumbprint, label))
-                })
-                .collect::<Vec<_>>()
+        let token = self.nss.get_token(token_uri);
+        let Some(token) = token else {
+            return ResultResponse::error(responses::GetCertificatesErrorCode::GenericError);
         };
+
+        // here PIN will be requested only if the token doesn't allow passwordless access to certs
+        let pin_callback = self.get_pin_callback(None, String::from("List certificates"));
+        let certs = self.nss.get_certs_in_token(&pin_callback, &token);
+        let Some(certs) = certs else {
+            return ResultResponse::error(responses::GetCertificatesErrorCode::GenericError);
+        };
+
+        let valid_certs = certs
+            .into_iter()
+            .filter_map(|cert| {
+                let der = cert.der();
+                let thumbprint = blake3::hash(der.as_ref()).to_string();
+
+                let (_, x509) = X509Certificate::from_der(der.as_ref()).ok()?;
+                let common_name = x509.subject().iter_common_name().next()?;
+                let label = common_name.as_str().ok()?.to_owned();
+
+                // keep only signing certs
+                let key_usage = x509.key_usage().ok()??.value;
+                if !(key_usage.digital_signature() && key_usage.non_repudiation()) {
+                    return None;
+                }
+
+                if !x509.validity().is_valid() {
+                    warn!("certificate \"{label}\" is either expired or not yet active");
+                    return None;
+                }
+
+                Some((der, thumbprint, label))
+            })
+            .collect::<Vec<_>>();
 
         session.certs_map.clear();
         let mut certificates = Vec::new();
@@ -302,7 +304,7 @@ impl<'a> Server<'a> {
         for (der, thumbprint, label) in valid_certs {
             session
                 .certs_map
-                .insert(thumbprint.clone(), (der, label.clone()));
+                .insert(thumbprint.clone(), (token_uri.clone(), der, label.clone()));
             certificates.push(responses::Certificate {
                 alias: thumbprint.clone(),
                 name: label,
@@ -318,7 +320,11 @@ impl<'a> Server<'a> {
         request: requests::GetSignedXml,
     ) -> ResultResponse<responses::GetSignedXml, responses::GetSignedXmlErrorCode> {
         let cert = session.certs_map.get(&request.certificate.alias);
-        let Some((der, label)) = cert else {
+        let Some((token_uri, der, cert_label)) = cert else {
+            return ResultResponse::error(responses::GetSignedXmlErrorCode::GenericError);
+        };
+
+        let Some(token) = self.nss.get_token(token_uri) else {
             return ResultResponse::error(responses::GetSignedXmlErrorCode::GenericError);
         };
 
@@ -326,25 +332,18 @@ impl<'a> Server<'a> {
             return ResultResponse::error(responses::GetSignedXmlErrorCode::GenericError);
         };
 
+        let reason = match try_identify_form(&document) {
+            Some(EporeziFormKind::LoginForm) => String::from("Log in to ePorezi"),
+            Some(EporeziFormKind::TaxForm(server_path)) => {
+                format!("Sign form {}", server_path)
+            }
+            None => String::from("Sign form (unidentified)"),
+        };
+
+        info!("signature request: {}: {}", cert_label, reason);
         {
-            let cert = label.clone();
-            let reason = match try_identify_form(&document) {
-                Some(EporeziFormKind::LoginForm) => "Log in to ePorezi".into(),
-                Some(EporeziFormKind::TaxForm(server_path)) => {
-                    format!("Sign form {}", server_path)
-                }
-                None => "Sign form (unidentified)".into(),
-            };
-
-            info!("signature request: {}: {}", cert, reason);
-
-            let pin_info = PinInfo {
-                cert: Some(cert),
-                reason,
-            };
-            let Ok(_guard) = self.pin_context.with_pin_info(pin_info) else {
-                return ResultResponse::error(responses::GetSignedXmlErrorCode::GenericError);
-            };
+            let pin_callback = self.get_pin_callback(Some(cert_label.clone()), reason);
+            let _logout_guard = self.nss.authenticate(&pin_callback, &token);
 
             let Ok(signer) = XmlSigner::with_cert(&self.xmlsec, der) else {
                 return ResultResponse::error(responses::GetSignedXmlErrorCode::GenericError);
@@ -358,6 +357,11 @@ impl<'a> Server<'a> {
         let xml = document.to_string().into_bytes();
 
         ResultResponse::success(responses::GetSignedXml { xml })
+    }
+
+    fn get_pin_callback(&'_ self, cert: Option<String>, reason: String) -> PinContext<'_> {
+        let pin_info = PinInfo { cert, reason };
+        PinContext::new(&*self.pin_prompt, pin_info)
     }
 
     fn parse_xml(&self, xml: Vec<u8>) -> Result<Document, XmlParseError> {

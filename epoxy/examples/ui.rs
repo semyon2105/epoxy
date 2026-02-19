@@ -18,7 +18,7 @@ async fn main() -> Result<(), Error> {
     };
     let token_name = "My Token".into();
 
-    let pin = pin_prompt.prompt_pin(pin_info, token_name);
+    let pin = pin_prompt.prompt_pin(&pin_info, token_name);
 
     let masked_pin = pin.map(|p| str::repeat("*", p.len()));
     info!("received PIN: {:?}", masked_pin);
