@@ -2,16 +2,15 @@ use futures::{
     FutureExt,
     future::{self, LocalBoxFuture},
 };
-use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::nss;
 
-pub type PinMethod = (Arc<dyn PinPrompt>, LocalBoxFuture<'static, ()>);
+pub type PinMethod = (Box<dyn PinPrompt>, LocalBoxFuture<'static, ()>);
 
 pub fn tty_pin_method(_: CancellationToken) -> PinMethod {
-    (Arc::new(TtyPinPrompt), future::pending().boxed_local())
+    (Box::new(TtyPinPrompt), future::pending().boxed_local())
 }
 
 #[derive(Debug, Clone)]
@@ -20,7 +19,7 @@ pub struct PinInfo {
     pub reason: String,
 }
 
-pub trait PinPrompt: Send + Sync {
+pub trait PinPrompt {
     fn prompt_pin(&self, pin_info: &PinInfo, token_name: String) -> Option<String>;
 }
 
@@ -37,13 +36,13 @@ impl PinPrompt for TtyPinPrompt {
     }
 }
 
-pub struct PinContext {
-    pin_prompt: Arc<dyn PinPrompt>,
+pub struct PinContext<'a> {
+    pin_prompt: &'a dyn PinPrompt,
     pin_info: PinInfo,
 }
 
-impl PinContext {
-    pub fn new(pin_prompt: Arc<dyn PinPrompt>, pin_info: PinInfo) -> PinContext {
+impl<'a> PinContext<'a> {
+    pub fn new(pin_prompt: &'a dyn PinPrompt, pin_info: PinInfo) -> PinContext<'a> {
         PinContext {
             pin_prompt,
             pin_info,
@@ -51,7 +50,7 @@ impl PinContext {
     }
 }
 
-impl nss::PinCallback for PinContext {
+impl<'a> nss::PinCallback for PinContext<'a> {
     fn get_pin(&self, token_name: String) -> Option<String> {
         debug!("requesting PIN for {}", token_name);
         self.pin_prompt.prompt_pin(&self.pin_info, token_name)

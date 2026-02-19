@@ -1,7 +1,6 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, hash_map::Entry},
-    sync::Arc,
 };
 
 use anyhow::{Context, Error, Result, anyhow};
@@ -17,7 +16,7 @@ use tungstenite::{Message, Utf8Bytes};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::{
-    nss::{Nss, PinCallback, SecItem, TokenUri},
+    nss::{Nss, SecItem, TokenUri},
     pin::{PinContext, PinInfo, PinPrompt},
     proto::{
         requests::{self, Request},
@@ -82,7 +81,7 @@ pub struct ServerConfig {
 
 pub struct Server {
     config: ServerConfig,
-    pin_prompt: Arc<dyn PinPrompt>,
+    pin_prompt: Box<dyn PinPrompt>,
     nss: Nss,
     xml_parser: Parser,
     xmlsec: XmlSec,
@@ -92,7 +91,7 @@ pub struct Server {
 impl Server {
     pub fn new(
         config: ServerConfig,
-        pin_prompt: Arc<dyn PinPrompt>,
+        pin_prompt: Box<dyn PinPrompt>,
         nss: Nss,
         xmlsec: XmlSec,
     ) -> Server {
@@ -269,7 +268,7 @@ impl Server {
 
         // here PIN will be requested only if the token doesn't allow passwordless access to certs
         let pin_callback = self.get_pin_callback(None, String::from("List certificates"));
-        let certs = self.nss.get_certs_in_token(pin_callback, &token);
+        let certs = self.nss.get_certs_in_token(&pin_callback, &token);
         let Some(certs) = certs else {
             return ResultResponse::error(responses::GetCertificatesErrorCode::GenericError);
         };
@@ -344,7 +343,7 @@ impl Server {
         info!("signature request: {}: {}", cert_label, reason);
         {
             let pin_callback = self.get_pin_callback(Some(cert_label.clone()), reason);
-            let _logout_guard = self.nss.authenticate(pin_callback, &token);
+            let _logout_guard = self.nss.authenticate(&pin_callback, &token);
 
             let Ok(signer) = XmlSigner::with_cert(&self.xmlsec, der) else {
                 return ResultResponse::error(responses::GetSignedXmlErrorCode::GenericError);
@@ -360,9 +359,9 @@ impl Server {
         ResultResponse::success(responses::GetSignedXml { xml })
     }
 
-    fn get_pin_callback(&self, cert: Option<String>, reason: String) -> Box<dyn PinCallback> {
+    fn get_pin_callback(&'_ self, cert: Option<String>, reason: String) -> PinContext<'_> {
         let pin_info = PinInfo { cert, reason };
-        Box::new(PinContext::new(self.pin_prompt.clone(), pin_info))
+        PinContext::new(&*self.pin_prompt, pin_info)
     }
 
     fn parse_xml(&self, xml: Vec<u8>) -> Result<Document, XmlParseError> {

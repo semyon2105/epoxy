@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use futures::FutureExt;
 use gtk4::gio::prelude::*;
@@ -30,7 +29,7 @@ pub fn ui_pin_method(ct: CancellationToken) -> PinMethod {
             error!("UI exited with error: {e}")
         }
     });
-    (Arc::new(pin_tx), ui_fut.boxed_local())
+    (std::boxed::Box::new(pin_tx), ui_fut.boxed_local())
 }
 
 fn run_ui(

@@ -10,7 +10,7 @@ use thiserror::Error;
 use tracing::error;
 use xmlsec_nss_sys::*;
 
-pub trait PinCallback: Send + Sync {
+pub trait PinCallback {
     fn get_pin(&self, token_name: String) -> Option<String>;
 }
 
@@ -98,7 +98,7 @@ impl Nss {
 
     pub fn get_certs_in_token<'a>(
         &'a self,
-        pin_callback: Box<dyn PinCallback>,
+        pin_callback: &'a dyn PinCallback,
         token: &'a Token<'a>,
     ) -> Option<CertList<'a>> {
         let _logout_guard = self.authenticate_unfriendly(pin_callback, token);
@@ -113,7 +113,7 @@ impl Nss {
 
     pub fn authenticate<'a>(
         &'a self,
-        pin_callback: Box<dyn PinCallback>,
+        pin_callback: &'a dyn PinCallback,
         token: &'a Token<'a>,
     ) -> TokenLogoutGuard<'a> {
         let pin_callback_ptr = &raw const pin_callback as *mut c_void;
@@ -123,7 +123,7 @@ impl Nss {
 
     fn authenticate_unfriendly<'a>(
         &'a self,
-        pin_callback: Box<dyn PinCallback>,
+        pin_callback: &'a dyn PinCallback,
         token: &'a Token<'a>,
     ) -> TokenLogoutGuard<'a> {
         let pin_callback_ptr = &raw const pin_callback as *mut c_void;
