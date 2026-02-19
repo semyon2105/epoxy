@@ -1,11 +1,12 @@
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use futures::FutureExt;
 use gtk4::gio::prelude::*;
 use gtk4::glib::{ExitCode, clone};
 use gtk4::{
-    Application, Box as GBox, Button, Label, Orientation, PasswordEntry, Separator, Window, glib,
+    Application, Box, Button, Label, Orientation, PasswordEntry, Separator, Window, glib,
     prelude::*,
 };
 use tokio::sync::mpsc;
@@ -29,7 +30,7 @@ pub fn ui_pin_method(ct: CancellationToken) -> PinMethod {
             error!("UI exited with error: {e}")
         }
     });
-    (Box::new(pin_tx), ui_fut.boxed_local())
+    (Arc::new(pin_tx), ui_fut.boxed_local())
 }
 
 fn run_ui(
@@ -98,7 +99,7 @@ fn new_pin_popup(app: &Application, pin_info: PinInfo, token_name: String, reply
 
     let cancel_button = Button::builder().label("Cancel").width_request(108).build();
 
-    let button_box = GBox::builder()
+    let button_box = Box::builder()
         .orientation(Orientation::Horizontal)
         .halign(gtk4::Align::End)
         .spacing(12)
@@ -107,7 +108,7 @@ fn new_pin_popup(app: &Application, pin_info: PinInfo, token_name: String, reply
     button_box.append(&ok_button);
     button_box.append(&cancel_button);
 
-    let content_box = GBox::builder()
+    let content_box = Box::builder()
         .orientation(Orientation::Vertical)
         .margin_start(12)
         .margin_end(12)
@@ -170,10 +171,10 @@ type PinReply = oneshot::Sender<Option<String>>;
 type PinChannelMessage = (PinInfo, String, PinReply);
 
 impl PinPrompt for mpsc::Sender<PinChannelMessage> {
-    fn prompt_pin(&self, pin_info: PinInfo, token_name: String) -> Option<String> {
+    fn prompt_pin(&self, pin_info: &PinInfo, token_name: String) -> Option<String> {
         let (reply_tx, reply_rx) = oneshot::channel();
 
-        self.try_send((pin_info, token_name, reply_tx))
+        self.try_send((pin_info.clone(), token_name, reply_tx))
             .map_err(|e| {
                 error!("failed to send PIN request to channel: {e}");
             })

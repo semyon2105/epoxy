@@ -3,7 +3,6 @@ use std::{
     fmt::Write,
     marker::PhantomData,
     ptr::{null, null_mut},
-    rc::Rc,
     sync::{Mutex, MutexGuard},
 };
 
@@ -27,12 +26,8 @@ use crate::nss;
 
 static INIT_LOCK: Mutex<()> = Mutex::new(());
 
-type XmlSecInitHandle = ();
-
-pub struct XmlSec<'a> {
-    nss: Rc<nss::Nss<'a>>,
+pub struct XmlSec {
     _guard: MutexGuard<'static, ()>,
-    _marker: PhantomData<(&'a nss::Nss<'a>, &'a XmlSecInitHandle)>,
 }
 
 #[derive(Debug, Error)]
@@ -45,9 +40,9 @@ pub enum InitError {
     XmlSec(i32),
 }
 
-impl<'a> XmlSec<'a> {
-    pub fn initialize(nss: Rc<nss::Nss<'a>>) -> Result<XmlSec<'a>, InitError> {
-        let Ok(guard) = INIT_LOCK.try_lock() else {
+impl XmlSec {
+    pub fn initialize() -> Result<XmlSec, InitError> {
+        let Ok(_guard) = INIT_LOCK.try_lock() else {
             return Err(InitError::AlreadyInitialized);
         };
 
@@ -71,15 +66,11 @@ impl<'a> XmlSec<'a> {
             return Err(InitError::XmlSec(code));
         }
 
-        Ok(XmlSec {
-            nss,
-            _guard: guard,
-            _marker: PhantomData,
-        })
+        Ok(XmlSec { _guard })
     }
 }
 
-impl<'a> Drop for XmlSec<'a> {
+impl Drop for XmlSec {
     fn drop(&mut self) {
         unsafe {
             xmlSecNssShutdown();
@@ -93,8 +84,7 @@ pub struct XmlSigner<'a> {
     subject: CString,
     serial_number: CString,
     dsig_ptr: xmlSecDSigCtxPtr,
-    _logout_guard: nss::LogoutGuard,
-    _marker: PhantomData<&'a XmlSec<'a>>,
+    _marker: PhantomData<&'a XmlSec>,
 }
 
 #[derive(Debug, Error)]
@@ -129,7 +119,7 @@ impl<'a> Drop for XmlSigner<'a> {
 
 impl<'a> XmlSigner<'a> {
     pub fn with_cert(
-        xmlsec: &'a XmlSec<'a>,
+        _xmlsec: &'a XmlSec,
         cert_item: &nss::SecItem,
     ) -> Result<XmlSigner<'a>, SignerInitError> {
         let der = cert_item.as_ref();
@@ -167,7 +157,6 @@ impl<'a> XmlSigner<'a> {
             subject,
             serial_number,
             dsig_ptr,
-            _logout_guard: xmlsec.nss.ensure_token_logout(),
             _marker: PhantomData,
         })
     }

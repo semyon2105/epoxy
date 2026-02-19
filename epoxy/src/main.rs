@@ -7,7 +7,7 @@ mod server;
 mod ui;
 mod xmlsec;
 
-use std::{io, rc::Rc, str::FromStr, sync::Arc, time::Duration};
+use std::{io, rc::Rc, str::FromStr, time::Duration};
 
 use anyhow::{Context, Result};
 use futures::{FutureExt, StreamExt, future::LocalBoxFuture};
@@ -24,8 +24,8 @@ use tracing_subscriber::EnvFilter;
 
 use crate::{
     config::{PinPromptKind, get_config},
-    nss::{Nss, NssGlobals},
-    pin::{PinContext, PinMethod, PinProvider, tty_pin_method},
+    nss::Nss,
+    pin::{PinMethod, tty_pin_method},
     server::{Server, ServerConfig},
     xmlsec::XmlSec,
 };
@@ -41,19 +41,14 @@ async fn main() -> Result<()> {
 
     let pin_method_ct = CancellationToken::new();
     let (pin_prompt, pin_method_fut) = get_pin_method(config.pin_prompt, pin_method_ct.clone());
-    let pin_context = Arc::new(PinContext::default());
-    let pin_provider = Box::new(PinProvider::new(pin_context.clone(), pin_prompt));
 
-    let nss_globals = NssGlobals::get_or_init(pin_provider);
-    let nss = Rc::new(
-        Nss::initialize(nss_globals, config.nssdb_path).context("failed to initialize NSS")?,
-    );
-    let xmlsec = XmlSec::initialize(nss.clone()).context("failed to initialize xmlsec")?;
+    let nss = Nss::initialize(config.nssdb_path).context("failed to initialize NSS")?;
+    let xmlsec = XmlSec::initialize().context("failed to initialize xmlsec")?;
 
     let server_config = ServerConfig {
         allow_soft_tokens: config.allow_soft_tokens,
     };
-    let server = Rc::new(Server::new(server_config, pin_context, nss, xmlsec));
+    let server = Rc::new(Server::new(server_config, pin_prompt, nss, xmlsec));
     let server_fut = serve(
         config.max_connections,
         config.max_idle_seconds,
@@ -139,14 +134,14 @@ fn serve<'a>(
     max_connections: u8,
     max_idle_seconds: u32,
     listener: TcpListener,
-    server: Rc<Server<'a>>,
+    server: Rc<Server>,
 ) -> LocalBoxFuture<'a, ()> {
     if max_idle_seconds == 0 {
         return TcpListenerStream::new(listener)
             .map(move |conn| handle_conn(server.clone(), conn))
             .buffer_unordered(max_connections as usize)
             .collect::<()>()
-            .boxed_local()
+            .boxed_local();
     }
 
     let timeout = Duration::from_secs(max_idle_seconds as u64);
@@ -173,7 +168,7 @@ fn serve<'a>(
     .boxed_local()
 }
 
-async fn handle_conn<'a>(server: Rc<Server<'a>>, conn: Result<TcpStream, io::Error>) {
+async fn handle_conn(server: Rc<Server>, conn: Result<TcpStream, io::Error>) {
     let stream = match conn {
         Ok(stream) => stream,
         Err(e) => {

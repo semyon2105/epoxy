@@ -4,80 +4,30 @@ use std::{
     os::raw::{c_char, c_void},
     ptr::{self, null, null_mut},
     slice,
-    sync::OnceLock,
 };
 
 use thiserror::Error;
+use tracing::error;
 use xmlsec_nss_sys::*;
-
-static NSS_GLOBALS: OnceLock<NssGlobals> = OnceLock::new();
 
 pub trait PinCallback: Send + Sync {
     fn get_pin(&self, token_name: String) -> Option<String>;
 }
 
-pub struct NssGlobals {
-    pin_callback: Box<dyn PinCallback>,
-}
-
-impl NssGlobals {
-    pub fn get_or_init(pin_callback: Box<dyn PinCallback>) -> &'static NssGlobals {
-        NSS_GLOBALS.get_or_init(|| {
-            unsafe { PK11_SetPasswordFunc(Some(Self::password_func)) };
-            NssGlobals { pin_callback }
-        })
-    }
-
-    extern "C" fn password_func(
-        token_ptr: *mut PK11SlotInfo,
-        retry: PRBool,
-        self_ptr: *mut c_void,
-    ) -> *mut c_char {
-        let self_ = if self_ptr.is_null() {
-            // workaround: xmlsec doesn't pass password callback context to NSS
-            NSS_GLOBALS.get().expect("NSS globals aren't initialized")
-        } else {
-            unsafe { &*(self_ptr as *const NssGlobals) }
-        };
-
-        if retry != 0 {
-            return null_mut();
-        }
-
-        let token = Token::from_raw(token_ptr);
-
-        let pin = self_.pin_callback.get_pin(token.name());
-        let Some(pin) = pin else {
-            return null_mut();
-        };
-
-        let pin = CString::new(pin).unwrap_or_default();
-        let pin_buf = pin.as_bytes_with_nul();
-        let in_buf_ptr = pin_buf.as_ptr().cast::<c_char>();
-        let out_buf_ptr = unsafe { PORT_Alloc(pin_buf.len()) } as *mut c_char;
-        unsafe { ptr::copy_nonoverlapping(in_buf_ptr, out_buf_ptr, pin_buf.len()) };
-
-        out_buf_ptr
-    }
-}
-
-pub struct Nss<'a> {
-    globals_ptr: *mut c_void,
+pub struct Nss {
     ptr: *mut NSSInitContext,
-    _marker: PhantomData<(&'static NssGlobals, &'a NSSInitContext)>,
 }
 
-impl<'a> Drop for Nss<'a> {
+impl Drop for Nss {
     fn drop(&mut self) {
         unsafe { NSS_ShutdownContext(self.ptr) };
     }
 }
 
-impl<'a> Nss<'a> {
-    pub fn initialize(
-        globals: &'static NssGlobals,
-        nssdb_path: String,
-    ) -> Result<Nss<'a>, InitError> {
+impl Nss {
+    pub fn initialize(nssdb_path: String) -> Result<Nss, InitError> {
+        unsafe { PK11_SetPasswordFunc(Some(Self::password_func)) };
+
         let nssdb_path = CString::new(nssdb_path).map_err(|_| InitError::Ffi)?;
         let flags = 0;
         let ptr = unsafe {
@@ -91,31 +41,96 @@ impl<'a> Nss<'a> {
             )
         };
 
-        Ok(Nss {
-            globals_ptr: &raw const *globals as *mut c_void,
-            ptr,
-            _marker: PhantomData,
-        })
+        Ok(Nss { ptr })
     }
 
-    pub fn ensure_token_logout(&self) -> LogoutGuard {
-        LogoutGuard(())
+    extern "C" fn password_func(
+        token_ptr: *mut PK11SlotInfo,
+        retry: PRBool,
+        pin_callback_ptr: *mut c_void,
+    ) -> *mut c_char {
+        if pin_callback_ptr.is_null() {
+            error!("bug: pin callback not provided");
+            return null_mut();
+        }
+        let pin_callback = unsafe { &*(pin_callback_ptr as *const Box<dyn PinCallback>) };
+
+        if retry != 0 {
+            return null_mut();
+        }
+
+        let token = Token::from_raw(token_ptr, false);
+        let Some(pin) = pin_callback.get_pin(token.name()) else {
+            return null_mut();
+        };
+
+        let pin = CString::new(pin).unwrap_or_default();
+        let pin_buf = pin.as_bytes_with_nul();
+        let in_buf_ptr = pin_buf.as_ptr().cast::<c_char>();
+        let out_buf_ptr = unsafe { PORT_Alloc(pin_buf.len()) } as *mut c_char;
+        unsafe { ptr::copy_nonoverlapping(in_buf_ptr, out_buf_ptr, pin_buf.len()) };
+
+        out_buf_ptr
     }
 
-    pub fn get_tokens(&self) -> TokenList<'a> {
-        let _guard = self.ensure_token_logout();
-
+    pub fn get_tokens<'a>(&'a self) -> Option<TokenList<'a>> {
         let ty = CKM_SHA256_RSA_PKCS as u64;
         let need_rw = PR_FALSE as i32;
         let load_certs = PR_FALSE as i32;
+        let pin_callback_ptr = null_mut(); // not sure if this operation ever needs login in practice
 
-        TokenList::from_raw(unsafe { PK11_GetAllTokens(ty, need_rw, load_certs, self.globals_ptr) })
+        let ptr = unsafe { PK11_GetAllTokens(ty, need_rw, load_certs, pin_callback_ptr) };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(TokenList::from_raw(ptr))
+        }
     }
 
-    pub fn get_certs_in_token(&'a self, token_uri: &TokenUri) -> CertList<'a> {
-        let _guard = self.ensure_token_logout();
+    pub fn get_token<'a>(&'a self, token_uri: &TokenUri) -> Option<Token<'a>> {
+        let ptr = unsafe { PK11_FindSlotByName(token_uri.0.as_ptr()) };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(Token::from_raw(ptr, true))
+        }
+    }
 
-        CertList::from_raw(unsafe { PK11_FindCertsFromURI(token_uri.0.as_ptr(), self.globals_ptr) })
+    pub fn get_certs_in_token<'a>(
+        &'a self,
+        pin_callback: Box<dyn PinCallback>,
+        token: &'a Token<'a>,
+    ) -> Option<CertList<'a>> {
+        let _logout_guard = self.authenticate_unfriendly(pin_callback, token);
+
+        let ptr = unsafe { PK11_ListCertsInSlot(token.ptr) };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(CertList::from_raw(ptr))
+        }
+    }
+
+    pub fn authenticate<'a>(
+        &'a self,
+        pin_callback: Box<dyn PinCallback>,
+        token: &'a Token<'a>,
+    ) -> TokenLogoutGuard<'a> {
+        let pin_callback_ptr = &raw const pin_callback as *mut c_void;
+        unsafe { PK11_Authenticate(token.ptr, PR_FALSE as i32, pin_callback_ptr) };
+        TokenLogoutGuard::new(token)
+    }
+
+    fn authenticate_unfriendly<'a>(
+        &'a self,
+        pin_callback: Box<dyn PinCallback>,
+        token: &'a Token<'a>,
+    ) -> TokenLogoutGuard<'a> {
+        let pin_callback_ptr = &raw const pin_callback as *mut c_void;
+        if !token.is_friendly() {
+            unsafe { PK11_Authenticate(token.ptr, PR_FALSE as i32, pin_callback_ptr) };
+        }
+        TokenLogoutGuard::new(token)
     }
 }
 
@@ -125,16 +140,26 @@ pub enum InitError {
     Ffi,
 }
 
-pub struct LogoutGuard(());
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TokenUri(CString);
 
-impl Drop for LogoutGuard {
-    fn drop(&mut self) {
-        unsafe { PK11_LogoutAll() }
+pub struct TokenLogoutGuard<'a> {
+    token: &'a Token<'a>,
+}
+
+impl<'a> TokenLogoutGuard<'a> {
+    fn new(token: &'a Token<'a>) -> TokenLogoutGuard<'a> {
+        TokenLogoutGuard { token }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TokenUri(CString);
+impl<'a> Drop for TokenLogoutGuard<'a> {
+    fn drop(&mut self) {
+        unsafe {
+            PK11_Logout(self.token.ptr);
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct SecItem(SECItem);
@@ -174,14 +199,24 @@ impl SecItem {
 }
 
 pub struct Token<'a> {
-    ptr: *const PK11SlotInfo,
+    ptr: *mut PK11SlotInfo,
+    is_owned: bool,
     _marker: PhantomData<&'a PK11SlotInfo>,
 }
 
+impl<'a> Drop for Token<'a> {
+    fn drop(&mut self) {
+        if self.is_owned {
+            unsafe { PK11_FreeSlot(self.ptr) }
+        }
+    }
+}
+
 impl<'a> Token<'a> {
-    fn from_raw(ptr: *const PK11SlotInfo) -> Token<'a> {
+    fn from_raw(ptr: *mut PK11SlotInfo, is_owned: bool) -> Token<'a> {
         Token {
             ptr,
+            is_owned,
             _marker: PhantomData,
         }
     }
@@ -248,7 +283,7 @@ impl<'a> Iterator for TokenListIter<'a> {
             return None;
         }
 
-        let token = Token::from_raw(unsafe { *self.next_ptr }.slot);
+        let token = Token::from_raw(unsafe { *self.next_ptr }.slot, false);
 
         self.next_ptr =
             unsafe { PK11_GetNextSafe(self.list_ptr as *mut _, self.next_ptr, PR_FALSE as i32) };
