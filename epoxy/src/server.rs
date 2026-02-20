@@ -228,7 +228,7 @@ impl Server {
             return ResultResponse::error(responses::GetTerminalsErrorCode::GenericError);
         };
 
-        let valid_tokens = tokens.into_iter().filter_map(|token| {
+        let valid_tokens = tokens.iter().filter_map(|token| {
             if (self.config.allow_soft_tokens || token.is_hw()) && !token.is_internal() {
                 Some((token.uri(), token.name()))
             } else {
@@ -276,7 +276,7 @@ impl Server {
         };
 
         let valid_certs = certs
-            .into_iter()
+            .iter()
             .filter_map(|cert| {
                 let der = cert.der();
                 let thumbprint = blake3::hash(der.as_ref()).to_string();
