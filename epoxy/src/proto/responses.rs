@@ -2,7 +2,7 @@ use serde::Serialize;
 use serde_repr::Serialize_repr;
 use serde_with::base64::{Base64, Standard};
 use serde_with::formats::Unpadded;
-use serde_with::serde_as;
+use serde_with::{DisplayFromStr, serde_as};
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "operation")]
@@ -41,7 +41,7 @@ impl<T, S> ResultResponse<T, S> {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SuccessResponse<T> {
-    status: i32,
+    status: u32,
     payload: T,
 }
 
@@ -68,7 +68,7 @@ impl<S> ErrorResponse<S> {
 pub struct OnOpenEvent {
     pub app_name: String,
     pub app_version: String,
-    pub app_build: i32,
+    pub app_build: u32,
     pub os_name: String,
     pub os_version: String,
     pub os_arch: String,
@@ -91,15 +91,15 @@ impl OnOpenEvent {
 #[serde(rename_all = "camelCase")]
 pub struct GetInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider_id: Option<i32>,
+    pub provider_id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub terminal_id: Option<i32>,
+    pub terminal_id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub certificate_id: Option<String>,
 }
 
 #[derive(Debug, Serialize_repr)]
-#[repr(i32)]
+#[repr(u32)]
 pub enum GetInfoErrorCode {
     GenericError = 1100,
 }
@@ -113,12 +113,12 @@ pub struct GetProviders {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Provider {
-    pub id: i32,
+    pub id: usize,
     pub name: String,
 }
 
 #[derive(Debug, Serialize_repr)]
-#[repr(i32)]
+#[repr(u32)]
 pub enum GetProvidersErrorCode {
     GenericError = 1200,
 }
@@ -132,12 +132,12 @@ pub struct GetTerminals {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Terminal {
-    pub id: i32,
+    pub id: usize,
     pub name: String,
 }
 
 #[derive(Debug, Serialize_repr)]
-#[repr(i32)]
+#[repr(u32)]
 pub enum GetTerminalsErrorCode {
     GenericError = 1300,
 }
@@ -148,15 +148,17 @@ pub struct GetCertificates {
     pub certificates: Vec<Certificate>,
 }
 
+#[serde_as]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Certificate {
-    pub alias: String,
+    #[serde_as(as = "DisplayFromStr")]
+    pub alias: usize,
     pub name: String,
 }
 
 #[derive(Debug, Serialize_repr)]
-#[repr(i32)]
+#[repr(u32)]
 pub enum GetCertificatesErrorCode {
     GenericError = 1400,
 }
@@ -170,7 +172,7 @@ pub struct GetSignedXml {
 }
 
 #[derive(Debug, Serialize_repr)]
-#[repr(i32)]
+#[repr(u32)]
 pub enum GetSignedXmlErrorCode {
     GenericError = 1500,
 }

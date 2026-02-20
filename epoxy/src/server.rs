@@ -1,8 +1,3 @@
-use std::{
-    cell::RefCell,
-    collections::{HashMap, hash_map::Entry},
-};
-
 use anyhow::{Context, Error, Result, anyhow};
 use futures::{SinkExt, StreamExt, TryStreamExt, future};
 use libxml::{
@@ -53,24 +48,10 @@ impl TryFrom<Message> for Request {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Session {
-    providers_map: HashMap<i32, &'static str>,
-    terminals_map: HashMap<i32, TokenUri>,
-    certs_map: HashMap<String, (TokenUri, SecItem, String)>,
-}
-
-impl Session {
-    pub fn new() -> Self {
-        let mut providers_map = HashMap::new();
-        providers_map.insert(0, "NSS");
-
-        Self {
-            providers_map,
-            terminals_map: HashMap::new(),
-            certs_map: HashMap::new(),
-        }
-    }
+    terminals: Vec<TokenUri>,
+    certs: Vec<(TokenUri, SecItem, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,7 +65,6 @@ pub struct Server {
     nss: Nss,
     xml_parser: Parser,
     xmlsec: XmlSec,
-    sessions: RefCell<HashMap<String, Session>>,
 }
 
 impl Server {
@@ -100,7 +80,6 @@ impl Server {
             nss,
             xml_parser: Parser::default(),
             xmlsec,
-            sessions: RefCell::new(HashMap::new()),
         }
     }
 
@@ -114,19 +93,21 @@ impl Server {
                 .and_then(|message| future::ready(Request::try_from(message))),
         );
 
-        let session_id = self
+        let session = self
             .handshake(&mut tx, &mut rx)
             .await
             .context("protocol handshake failed")?;
 
-        self.handle_requests(tx, rx, session_id).await
+        self.handle_requests(tx, rx, session)
+            .await
+            .context("request handler failed")
     }
 
     async fn handshake(
         &self,
         mut tx: impl SinkExt<Response, Error = Error> + Unpin,
         mut rx: impl TryStreamExt<Ok = Request, Error = Error> + Unpin,
-    ) -> Result<String> {
+    ) -> Result<Session> {
         let on_open_event = SuccessResponse::new(responses::OnOpenEvent::with_mocked_info());
         tx.send(Response::OnOpenEvent(on_open_event)).await?;
 
@@ -142,60 +123,37 @@ impl Server {
             return Err(anyhow!("invalid first GET_INFO request"));
         }
 
-        let session_id = get_info_req.sb_session;
+        tx.send(Response::GetInfo(self.get_info())).await?;
 
-        let get_info_response = {
-            let mut sessions = self.sessions.borrow_mut();
-            let session = sessions.entry(session_id.clone()).or_insert(Session::new());
-            Response::GetInfo(self.get_info(session))
-        };
-
-        tx.send(get_info_response).await?;
-
-        Ok(session_id)
+        Ok(Session::default())
     }
 
     async fn handle_requests(
         &self,
         mut tx: impl SinkExt<Response, Error = Error> + Unpin,
         mut rx: impl TryStreamExt<Ok = Request, Error = Error> + Unpin,
-        session_id: String,
+        mut session: Session,
     ) -> Result<()> {
         while let Some(request) = rx.try_next().await? {
-            let response = {
-                // TODO: remove stale sessions or remove session tracking entirely (client doesn't seem to need it)
-                let mut sessions = self.sessions.borrow_mut();
-                let Entry::Occupied(mut entry) = sessions.entry(session_id.clone()) else {
-                    return Err(anyhow!("session does not exist: {}", session_id));
-                };
-
-                match request {
-                    Request::GetInfo(_) => Response::GetInfo(self.get_info(entry.get())),
-                    Request::GetProviders => {
-                        Response::GetProviders(self.get_providers(entry.get()))
-                    }
-                    Request::GetTerminals(req) => {
-                        Response::GetTerminals(self.get_terminals(entry.get_mut(), req))
-                    }
-                    Request::GetCertificates(req) => {
-                        Response::GetCertificates(self.get_certificates(entry.get_mut(), req))
-                    }
-                    Request::GetSignedXml(req) => {
-                        Response::GetSignedXml(self.get_signed_xml(entry.get_mut(), req))
-                    }
+            let response = match request {
+                Request::GetInfo(_) => Response::GetInfo(self.get_info()),
+                Request::GetProviders => Response::GetProviders(self.get_providers()),
+                Request::GetTerminals(_) => {
+                    Response::GetTerminals(self.get_terminals(&mut session))
+                }
+                Request::GetCertificates(req) => {
+                    Response::GetCertificates(self.get_certificates(&mut session, req))
+                }
+                Request::GetSignedXml(req) => {
+                    Response::GetSignedXml(self.get_signed_xml(&session, req))
                 }
             };
-
             tx.send(response).await?;
         }
-
         Ok(())
     }
 
-    fn get_info(
-        &self,
-        _session: &Session,
-    ) -> ResultResponse<responses::GetInfo, responses::GetInfoErrorCode> {
+    fn get_info(&self) -> ResultResponse<responses::GetInfo, responses::GetInfoErrorCode> {
         ResultResponse::success(responses::GetInfo {
             provider_id: None,
             terminal_id: None,
@@ -205,23 +163,17 @@ impl Server {
 
     fn get_providers(
         &self,
-        session: &Session,
     ) -> ResultResponse<responses::GetProviders, responses::GetProvidersErrorCode> {
-        let providers = session
-            .providers_map
-            .iter()
-            .map(|p| responses::Provider {
-                id: *p.0,
-                name: String::from(*p.1),
-            })
-            .collect();
+        let providers = vec![responses::Provider {
+            id: 0,
+            name: String::from("NSS"),
+        }];
         ResultResponse::success(responses::GetProviders { providers })
     }
 
     fn get_terminals(
         &self,
         session: &mut Session,
-        _request: requests::GetTerminals,
     ) -> ResultResponse<responses::GetTerminals, responses::GetTerminalsErrorCode> {
         let tokens = self.nss.get_tokens();
         let Some(tokens) = tokens else {
@@ -236,15 +188,12 @@ impl Server {
             }
         });
 
-        session.terminals_map.clear();
+        session.terminals.clear();
         let mut terminals = Vec::new();
 
         for (index, (uri, name)) in valid_tokens.enumerate() {
-            session.terminals_map.insert(index as i32, uri);
-            terminals.push(responses::Terminal {
-                id: index as i32,
-                name,
-            });
+            session.terminals.push(uri);
+            terminals.push(responses::Terminal { id: index, name });
         }
 
         ResultResponse::success(responses::GetTerminals { terminals })
@@ -255,7 +204,7 @@ impl Server {
         session: &mut Session,
         request: requests::GetCertificates,
     ) -> ResultResponse<responses::GetCertificates, responses::GetCertificatesErrorCode> {
-        let token_uri = session.terminals_map.get(&request.terminal_id);
+        let token_uri = session.terminals.get(request.terminal_id);
         let Some(token_uri) = token_uri else {
             return ResultResponse::error(responses::GetCertificatesErrorCode::GenericError);
         };
@@ -275,40 +224,34 @@ impl Server {
             return ResultResponse::error(responses::GetCertificatesErrorCode::GenericError);
         };
 
-        let valid_certs = certs
-            .iter()
-            .filter_map(|cert| {
-                let der = cert.der();
-                let thumbprint = blake3::hash(der.as_ref()).to_string();
+        let valid_certs = certs.iter().filter_map(|cert| {
+            let der = cert.der();
 
-                let (_, x509) = X509Certificate::from_der(der.as_ref()).ok()?;
-                let common_name = x509.subject().iter_common_name().next()?;
-                let label = common_name.as_str().ok()?.to_owned();
+            let (_, x509) = X509Certificate::from_der(der.as_ref()).ok()?;
+            let common_name = x509.subject().iter_common_name().next()?;
+            let label = common_name.as_str().ok()?.to_owned();
 
-                // keep only signing certs
-                let key_usage = x509.key_usage().ok()??.value;
-                if !(key_usage.digital_signature() && key_usage.non_repudiation()) {
-                    return None;
-                }
+            // keep only signing certs
+            let key_usage = x509.key_usage().ok()??.value;
+            if !(key_usage.digital_signature() && key_usage.non_repudiation()) {
+                return None;
+            }
 
-                if !x509.validity().is_valid() {
-                    warn!("certificate \"{label}\" is either expired or not yet active");
-                    return None;
-                }
+            if !x509.validity().is_valid() {
+                warn!("certificate \"{label}\" is either expired or not yet active");
+                return None;
+            }
 
-                Some((der, thumbprint, label))
-            })
-            .collect::<Vec<_>>();
+            Some((der, label))
+        });
 
-        session.certs_map.clear();
+        session.certs.clear();
         let mut certificates = Vec::new();
 
-        for (der, thumbprint, label) in valid_certs {
-            session
-                .certs_map
-                .insert(thumbprint.clone(), (token_uri.clone(), der, label.clone()));
+        for (index, (der, label)) in valid_certs.enumerate() {
+            session.certs.push((token_uri.clone(), der, label.clone()));
             certificates.push(responses::Certificate {
-                alias: thumbprint.clone(),
+                alias: index,
                 name: label,
             });
         }
@@ -318,10 +261,10 @@ impl Server {
 
     fn get_signed_xml(
         &self,
-        session: &mut Session,
+        session: &Session,
         request: requests::GetSignedXml,
     ) -> ResultResponse<responses::GetSignedXml, responses::GetSignedXmlErrorCode> {
-        let cert = session.certs_map.get(&request.certificate.alias);
+        let cert = session.certs.get(request.certificate.alias);
         let Some((token_uri, der, cert_label)) = cert else {
             return ResultResponse::error(responses::GetSignedXmlErrorCode::GenericError);
         };
