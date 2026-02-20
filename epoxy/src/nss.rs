@@ -7,11 +7,31 @@ use std::{
 };
 
 use thiserror::Error;
-use tracing::error;
+use tracing::{debug, error};
 use xmlsec_nss_sys::*;
 
-pub trait PinCallback {
-    fn get_pin(&self, token_name: String) -> Option<String>;
+pub trait PinPrompt {
+    fn prompt_pin(&self, pin_info: &PinInfo, token_name: String) -> Option<String>;
+}
+
+#[derive(Debug, Clone)]
+pub struct PinInfo {
+    pub cert: Option<String>,
+    pub reason: String,
+}
+
+pub struct PinContext<'a> {
+    pin_prompt: &'a dyn PinPrompt,
+    pin_info: PinInfo,
+}
+
+impl<'a> PinContext<'a> {
+    pub fn new(pin_prompt: &'a dyn PinPrompt, pin_info: PinInfo) -> PinContext<'a> {
+        PinContext {
+            pin_prompt,
+            pin_info,
+        }
+    }
 }
 
 pub struct Nss {
@@ -47,20 +67,25 @@ impl Nss {
     extern "C" fn password_func(
         token_ptr: *mut PK11SlotInfo,
         retry: PRBool,
-        pin_callback_ptr: *mut c_void,
+        pin_context_ptr: *mut c_void,
     ) -> *mut c_char {
-        if pin_callback_ptr.is_null() {
-            error!("bug: pin callback not provided");
+        if pin_context_ptr.is_null() {
+            error!("bug: pin context not provided");
             return null_mut();
         }
-        let pin_callback = unsafe { &*(pin_callback_ptr as *const Box<dyn PinCallback>) };
+        let PinContext {
+            pin_prompt,
+            pin_info,
+        } = unsafe { &*(pin_context_ptr as *const PinContext) };
 
         if retry != 0 {
             return null_mut();
         }
 
-        let token = Token::from_raw(token_ptr, false);
-        let Some(pin) = pin_callback.get_pin(token.name()) else {
+        let token_name = Token::from_raw(token_ptr, false).name();
+
+        debug!("requesting PIN for {}", token_name);
+        let Some(pin) = pin_prompt.prompt_pin(pin_info, token_name) else {
             return null_mut();
         };
 
@@ -77,9 +102,9 @@ impl Nss {
         let ty = CKM_SHA256_RSA_PKCS as u64;
         let need_rw = PR_FALSE as i32;
         let load_certs = PR_FALSE as i32;
-        let pin_callback_ptr = null_mut(); // not sure if this operation ever needs login in practice
+        let pin_context_ptr = null_mut(); // not sure if this operation ever needs login in practice
 
-        let ptr = unsafe { PK11_GetAllTokens(ty, need_rw, load_certs, pin_callback_ptr) };
+        let ptr = unsafe { PK11_GetAllTokens(ty, need_rw, load_certs, pin_context_ptr) };
         if ptr.is_null() {
             None
         } else {
@@ -98,39 +123,45 @@ impl Nss {
 
     pub fn get_certs_in_token<'a>(
         &'a self,
-        pin_callback: &'a dyn PinCallback,
+        pin_context: &'a PinContext,
         token: &'a Token<'a>,
-    ) -> Option<CertList<'a>> {
-        let _logout_guard = self.authenticate_unfriendly(pin_callback, token);
+    ) -> Result<Option<CertList<'a>>, TokenAuthError> {
+        let _logout_guard = self.authenticate_unfriendly(pin_context, token)?;
 
         let ptr = unsafe { PK11_ListCertsInSlot(token.ptr) };
         if ptr.is_null() {
-            None
+            Ok(None)
         } else {
-            Some(CertList::from_raw(ptr))
+            Ok(Some(CertList::from_raw(ptr)))
         }
     }
 
     pub fn authenticate<'a>(
         &'a self,
-        pin_callback: &'a dyn PinCallback,
+        pin_context: &'a PinContext,
         token: &'a Token<'a>,
-    ) -> TokenLogoutGuard<'a> {
-        let pin_callback_ptr = &raw const pin_callback as *mut c_void;
-        unsafe { PK11_Authenticate(token.ptr, PR_FALSE as i32, pin_callback_ptr) };
-        TokenLogoutGuard::new(token)
+    ) -> Result<TokenLogoutGuard<'a>, TokenAuthError> {
+        let pin_context_ptr = &raw const *pin_context as *mut c_void;
+        let code = unsafe { PK11_Authenticate(token.ptr, PR_FALSE as i32, pin_context_ptr) };
+        if code != _SECStatus_SECSuccess {
+            return Err(TokenAuthError(()));
+        }
+        Ok(TokenLogoutGuard::new(token))
     }
 
     fn authenticate_unfriendly<'a>(
         &'a self,
-        pin_callback: &'a dyn PinCallback,
+        pin_context: &'a PinContext,
         token: &'a Token<'a>,
-    ) -> TokenLogoutGuard<'a> {
-        let pin_callback_ptr = &raw const pin_callback as *mut c_void;
+    ) -> Result<TokenLogoutGuard<'a>, TokenAuthError> {
+        let pin_context_ptr = &raw const *pin_context as *mut c_void;
         if !token.is_friendly() {
-            unsafe { PK11_Authenticate(token.ptr, PR_FALSE as i32, pin_callback_ptr) };
+            let code = unsafe { PK11_Authenticate(token.ptr, PR_FALSE as i32, pin_context_ptr) };
+            if code != _SECStatus_SECSuccess {
+                return Err(TokenAuthError(()));
+            }
         }
-        TokenLogoutGuard::new(token)
+        Ok(TokenLogoutGuard::new(token))
     }
 }
 
@@ -160,6 +191,10 @@ impl<'a> Drop for TokenLogoutGuard<'a> {
         }
     }
 }
+
+#[derive(Debug, Error)]
+#[error("token auth failed")]
+pub struct TokenAuthError(());
 
 #[derive(Debug)]
 pub struct SecItem(SECItem);
