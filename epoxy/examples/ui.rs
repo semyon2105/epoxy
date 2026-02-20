@@ -1,7 +1,7 @@
 //! Open PIN dialog with mock data
 
 use anyhow::Error;
-use epoxy::{pin::PinInfo, ui};
+use epoxy::{nss::PinInfo, ui};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
