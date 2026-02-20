@@ -13,7 +13,8 @@ use tokio::task;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
-use crate::pin::{PinInfo, PinMethod, PinPrompt};
+use crate::nss::{PinInfo, PinPrompt};
+use crate::pin::PinMethod;
 
 pub fn ui_pin_method(ct: CancellationToken) -> PinMethod {
     let app_id = "dev.semyon.epoxy";

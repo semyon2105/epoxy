@@ -16,8 +16,7 @@ use tungstenite::{Message, Utf8Bytes};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::{
-    nss::{Nss, SecItem, TokenUri},
-    pin::{PinContext, PinInfo, PinPrompt},
+    nss::{Nss, PinContext, PinInfo, PinPrompt, SecItem, TokenUri},
     proto::{
         requests::{self, Request},
         responses::{self, Response, ResultResponse, SuccessResponse},
@@ -267,8 +266,11 @@ impl Server {
         };
 
         // here PIN will be requested only if the token doesn't allow passwordless access to certs
-        let pin_callback = self.get_pin_callback(None, String::from("List certificates"));
-        let certs = self.nss.get_certs_in_token(&pin_callback, &token);
+        let pin_context = self.get_pin_context(None, String::from("List certificates"));
+        let Ok(certs) = self.nss.get_certs_in_token(&pin_context, &token) else {
+            warn!("failed to log in to {}", token.name());
+            return ResultResponse::error(responses::GetCertificatesErrorCode::GenericError);
+        };
         let Some(certs) = certs else {
             return ResultResponse::error(responses::GetCertificatesErrorCode::GenericError);
         };
@@ -342,8 +344,11 @@ impl Server {
 
         info!("signature request: {}: {}", cert_label, reason);
         {
-            let pin_callback = self.get_pin_callback(Some(cert_label.clone()), reason);
-            let _logout_guard = self.nss.authenticate(&pin_callback, &token);
+            let pin_context = self.get_pin_context(Some(cert_label.clone()), reason);
+            let Ok(_logout_guard) = self.nss.authenticate(&pin_context, &token) else {
+                warn!("failed to log in to {}", token.name());
+                return ResultResponse::error(responses::GetSignedXmlErrorCode::GenericError);
+            };
 
             let Ok(signer) = XmlSigner::with_cert(&self.xmlsec, der) else {
                 return ResultResponse::error(responses::GetSignedXmlErrorCode::GenericError);
@@ -359,7 +364,7 @@ impl Server {
         ResultResponse::success(responses::GetSignedXml { xml })
     }
 
-    fn get_pin_callback(&'_ self, cert: Option<String>, reason: String) -> PinContext<'_> {
+    fn get_pin_context(&'_ self, cert: Option<String>, reason: String) -> PinContext<'_> {
         let pin_info = PinInfo { cert, reason };
         PinContext::new(&*self.pin_prompt, pin_info)
     }
