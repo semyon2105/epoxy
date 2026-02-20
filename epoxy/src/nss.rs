@@ -236,7 +236,7 @@ impl SecItem {
 pub struct Token<'a> {
     ptr: *mut PK11SlotInfo,
     is_owned: bool,
-    _marker: PhantomData<&'a PK11SlotInfo>,
+    _marker: PhantomData<&'a Nss>,
 }
 
 impl<'a> Drop for Token<'a> {
@@ -286,10 +286,14 @@ impl<'a> Token<'a> {
 
 pub struct TokenList<'a> {
     ptr: *mut PK11SlotList,
-    _marker: PhantomData<[Token<'a>]>,
+    _marker: PhantomData<&'a Nss>,
 }
 
 impl<'a> TokenList<'a> {
+    pub fn iter(&'a self) -> TokenListIter<'a> {
+        TokenListIter::new(self)
+    }
+
     fn from_raw(ptr: *mut PK11SlotList) -> TokenList<'a> {
         TokenList {
             ptr,
@@ -305,45 +309,39 @@ impl<'a> Drop for TokenList<'a> {
 }
 
 pub struct TokenListIter<'a> {
-    list_ptr: *const PK11SlotList,
-    next_ptr: *mut PK11SlotListElement,
-    _marker: PhantomData<&'a TokenList<'a>>,
+    list: &'a TokenList<'a>,
+    item_ptr: *mut PK11SlotListElement,
+}
+
+impl<'a> TokenListIter<'a> {
+    fn new(list: &'a TokenList<'a>) -> TokenListIter<'a> {
+        TokenListIter {
+            list,
+            item_ptr: unsafe { PK11_GetFirstSafe(list.ptr) },
+        }
+    }
 }
 
 impl<'a> Iterator for TokenListIter<'a> {
     type Item = Token<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next_ptr.is_null() {
+        if self.item_ptr.is_null() {
             return None;
         }
 
-        let token = Token::from_raw(unsafe { *self.next_ptr }.slot, false);
+        let token = Token::from_raw(unsafe { *self.item_ptr }.slot, false);
 
-        self.next_ptr =
-            unsafe { PK11_GetNextSafe(self.list_ptr as *mut _, self.next_ptr, PR_FALSE as i32) };
+        self.item_ptr =
+            unsafe { PK11_GetNextSafe(self.list.ptr as *mut _, self.item_ptr, PR_FALSE as i32) };
 
         Some(token)
     }
 }
 
-impl<'a> IntoIterator for &'a TokenList<'a> {
-    type Item = Token<'a>;
-
-    type IntoIter = TokenListIter<'a>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        TokenListIter {
-            list_ptr: self.ptr,
-            next_ptr: unsafe { PK11_GetFirstSafe(self.ptr) },
-            _marker: PhantomData,
-        }
-    }
-}
-
 pub struct Cert<'a> {
     ptr: *const CERTCertificate,
-    _marker: PhantomData<&'a CERTCertificate>,
+    _marker: PhantomData<&'a Nss>,
 }
 
 impl<'a> Cert<'a> {
@@ -361,7 +359,7 @@ impl<'a> Cert<'a> {
 
 pub struct CertList<'a> {
     ptr: *mut CERTCertList,
-    _marker: PhantomData<[Cert<'a>]>,
+    _marker: PhantomData<&'a Nss>,
 }
 
 impl<'a> Drop for CertList<'a> {
@@ -373,54 +371,64 @@ impl<'a> Drop for CertList<'a> {
 }
 
 impl<'a> CertList<'a> {
+    pub fn iter(&'a self) -> CertListIter<'a> {
+        CertListIter::new(self)
+    }
+
     fn from_raw(ptr: *mut CERTCertList) -> CertList<'a> {
         CertList {
             ptr,
             _marker: PhantomData,
         }
     }
+
+    fn list_ptr(&self) -> *const PRCList {
+        unsafe { &raw const (*self.ptr).list }
+    }
+
+    fn is_end(&self, node_ptr: *const CERTCertListNode) -> bool {
+        node_ptr.addr() == self.list_ptr().addr()
+    }
+
+    fn head_ptr(&self) -> Option<*const CERTCertListNode> {
+        let node_ptr = unsafe { *self.list_ptr() }.next as *const CERTCertListNode;
+        if self.is_end(node_ptr) {
+            None
+        } else {
+            Some(node_ptr)
+        }
+    }
+
+    fn next_ptr(&self, node_ptr: *const CERTCertListNode) -> Option<*const CERTCertListNode> {
+        let node_ptr = unsafe { *node_ptr }.links.next as *const CERTCertListNode;
+        if self.is_end(node_ptr) {
+            None
+        } else {
+            Some(node_ptr)
+        }
+    }
 }
 
 pub struct CertListIter<'a> {
-    list_ptr: *const PRCList,
-    next_ptr: *const CERTCertListNode,
-    _marker: PhantomData<&'a CertList<'a>>,
+    list: &'a CertList<'a>,
+    item_ptr: Option<*const CERTCertListNode>,
+}
+
+impl<'a> CertListIter<'a> {
+    fn new(list: &'a CertList<'a>) -> CertListIter<'a> {
+        CertListIter {
+            list,
+            item_ptr: list.head_ptr(),
+        }
+    }
 }
 
 impl<'a> Iterator for CertListIter<'a> {
     type Item = Cert<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next_ptr.is_null() || self.next_ptr.addr() == self.list_ptr.addr() {
-            return None;
-        }
-
-        let node = unsafe { *self.next_ptr };
-        let cert = Cert::from_raw(node.cert);
-
-        self.next_ptr = node.links.next as *const CERTCertListNode;
-
-        Some(cert)
-    }
-}
-
-impl<'a> IntoIterator for &'a CertList<'a> {
-    type Item = Cert<'a>;
-
-    type IntoIter = CertListIter<'a>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        let list_ptr = unsafe { &raw const (*self.ptr).list };
-        let next_ptr = if list_ptr.is_null() {
-            null()
-        } else {
-            (unsafe { (*list_ptr).next }) as *const CERTCertListNode
-        };
-
-        CertListIter {
-            list_ptr,
-            next_ptr,
-            _marker: PhantomData,
-        }
+        let item_ptr = self.item_ptr?;
+        self.item_ptr = self.list.next_ptr(item_ptr);
+        Some(Cert::from_raw(unsafe { *item_ptr }.cert))
     }
 }
