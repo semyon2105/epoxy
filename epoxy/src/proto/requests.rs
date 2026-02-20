@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use serde_with::base64::{Base64, Standard};
 use serde_with::formats::Unpadded;
-use serde_with::serde_as;
+use serde_with::{DisplayFromStr, serde_as};
 
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Deserialize)]
@@ -12,6 +12,7 @@ pub enum Request {
     #[serde(rename = "GET_PROVIDERS")]
     GetProviders,
     #[serde(rename = "GET_TERMINALS")]
+    #[allow(unused)]
     GetTerminals(GetTerminals),
     #[serde(rename = "GET_CERTIFICATES")]
     GetCertificates(GetCertificates),
@@ -34,13 +35,13 @@ pub struct GetInfo {
 #[serde(rename_all = "camelCase")]
 pub struct GetTerminals {
     #[allow(unused)]
-    pub provider_id: i32,
+    pub provider_id: usize,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetCertificates {
-    pub terminal_id: i32,
+    pub terminal_id: usize,
     #[allow(unused)]
     #[serde(skip)]
     pub pin: String,
@@ -58,10 +59,12 @@ pub struct GetSignedXml {
     pub xml: Vec<u8>,
 }
 
+#[serde_as]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Certificate {
-    pub alias: String,
+    #[serde_as(as = "DisplayFromStr")]
+    pub alias: usize,
     #[allow(unused)]
     #[serde(skip)]
     pub name: String,
