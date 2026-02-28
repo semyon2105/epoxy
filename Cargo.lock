@@ -450,7 +450,6 @@ name = "epoxy"
 version = "0.4.0"
 dependencies = [
  "anyhow",
- "base64",
  "clap",
  "dirs",
  "futures",
@@ -472,7 +471,6 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
- "tracing-log",
  "tracing-subscriber",
  "tungstenite",
  "x509-parser",
