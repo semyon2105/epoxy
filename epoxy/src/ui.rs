@@ -136,6 +136,20 @@ fn new_pin_popup(app: &Application, pin_info: PinInfo, token_name: String, reply
         .build();
 
     let reply_cell = Rc::new(RefCell::new(Some(reply)));
+    pin_entry.connect_activate(clone!(
+        #[strong]
+        reply_cell,
+        #[weak]
+        window,
+        #[weak]
+        pin_entry,
+        move |_| {
+            if let Some(reply) = reply_cell.take() {
+                let _result = reply.send(Some(pin_entry.text().into()));
+            }
+            window.destroy();
+        }
+    ));
     ok_button.connect_clicked(clone!(
         #[strong]
         reply_cell,
