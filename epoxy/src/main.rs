@@ -7,7 +7,7 @@ mod server;
 mod ui;
 mod xmlsec;
 
-use std::{io, rc::Rc, str::FromStr, time::Duration};
+use std::{cell::LazyCell, io, rc::Rc, str::FromStr, time::Duration};
 
 use anyhow::{Context, Result};
 use futures::{FutureExt, StreamExt, future::LocalBoxFuture};
@@ -19,7 +19,7 @@ use tokio_debouncer::{DebounceMode, Debouncer};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_tungstenite::accept_async;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::{
@@ -42,13 +42,18 @@ async fn main() -> Result<()> {
     let pin_method_ct = CancellationToken::new();
     let (pin_prompt, pin_method_fut) = get_pin_method(config.pin_prompt, pin_method_ct.clone());
 
-    let nss = Nss::initialize(config.nssdb_path).context("failed to initialize NSS")?;
-    let xmlsec = XmlSec::initialize().context("failed to initialize xmlsec")?;
+    let nss_xmlsec = LazyCell::new(move || {
+        let nss = Nss::initialize(config.nssdb_path).expect("failed to initialize NSS");
+        debug!("NSS initialized");
+        let xmlsec = XmlSec::initialize().expect("failed to initialize xmlsec");
+        debug!("xmlsec initialized");
+        (nss, xmlsec)
+    });
 
     let server_config = ServerConfig {
         allow_soft_tokens: config.allow_soft_tokens,
     };
-    let server = Rc::new(Server::new(server_config, pin_prompt, nss, xmlsec));
+    let server = Rc::new(Server::new(server_config, pin_prompt, nss_xmlsec));
     let server_fut = serve(
         config.max_connections,
         config.max_idle_seconds,
@@ -130,12 +135,15 @@ async fn get_sockaddr_listener(endpoint: &str) -> Result<TcpListener> {
     Ok(listener)
 }
 
-fn serve<'a>(
+fn serve<'a, F>(
     max_connections: u8,
     max_idle_seconds: u32,
     listener: TcpListener,
-    server: Rc<Server>,
-) -> LocalBoxFuture<'a, ()> {
+    server: Rc<Server<F>>,
+) -> LocalBoxFuture<'a, ()>
+where
+    F: FnOnce() -> (Nss, XmlSec) + 'a
+{
     if max_idle_seconds == 0 {
         return TcpListenerStream::new(listener)
             .map(move |conn| handle_conn(server.clone(), conn))
@@ -168,7 +176,10 @@ fn serve<'a>(
     .boxed_local()
 }
 
-async fn handle_conn(server: Rc<Server>, conn: Result<TcpStream, io::Error>) {
+async fn handle_conn<F>(server: Rc<Server<F>>, conn: Result<TcpStream, io::Error>)
+where
+    F: FnOnce() -> (Nss, XmlSec)
+{
     let stream = match conn {
         Ok(stream) => stream,
         Err(e) => {

@@ -1,3 +1,5 @@
+use std::cell::LazyCell;
+
 use anyhow::{Context, Error, Result, anyhow};
 use futures::{SinkExt, StreamExt, TryStreamExt, future};
 use libxml::{
@@ -59,27 +61,27 @@ pub struct ServerConfig {
     pub allow_soft_tokens: bool,
 }
 
-pub struct Server {
+pub struct Server<F> {
     config: ServerConfig,
     pin_prompt: Box<dyn PinPrompt>,
-    nss: Nss,
+    nss_xmlsec: LazyCell<(Nss, XmlSec), F>,
     xml_parser: Parser,
-    xmlsec: XmlSec,
 }
 
-impl Server {
+impl<F> Server<F>
+where
+    F: FnOnce() -> (Nss, XmlSec)
+{
     pub fn new(
         config: ServerConfig,
         pin_prompt: Box<dyn PinPrompt>,
-        nss: Nss,
-        xmlsec: XmlSec,
-    ) -> Server {
+        nss_xmlsec: LazyCell<(Nss, XmlSec), F>,
+    ) -> Server<F> {
         Server {
             config,
             pin_prompt,
-            nss,
+            nss_xmlsec,
             xml_parser: Parser::default(),
-            xmlsec,
         }
     }
 
@@ -175,7 +177,9 @@ impl Server {
         &self,
         session: &mut Session,
     ) -> ResultResponse<responses::GetTerminals, responses::GetTerminalsErrorCode> {
-        let tokens = self.nss.get_tokens();
+        let (ref nss, _) = *self.nss_xmlsec;
+
+        let tokens = nss.get_tokens();
         let Some(tokens) = tokens else {
             return ResultResponse::error(responses::GetTerminalsErrorCode::GenericError);
         };
@@ -204,19 +208,21 @@ impl Server {
         session: &mut Session,
         request: requests::GetCertificates,
     ) -> ResultResponse<responses::GetCertificates, responses::GetCertificatesErrorCode> {
+        let (ref nss, _) = *self.nss_xmlsec;
+
         let token_uri = session.terminals.get(request.terminal_id);
         let Some(token_uri) = token_uri else {
             return ResultResponse::error(responses::GetCertificatesErrorCode::GenericError);
         };
 
-        let token = self.nss.get_token(token_uri);
+        let token = nss.get_token(token_uri);
         let Some(token) = token else {
             return ResultResponse::error(responses::GetCertificatesErrorCode::GenericError);
         };
 
         // here PIN will be requested only if the token doesn't allow passwordless access to certs
         let pin_context = self.get_pin_context(None, String::from("List certificates"));
-        let Ok(certs) = self.nss.get_certs_in_token(&pin_context, &token) else {
+        let Ok(certs) = nss.get_certs_in_token(&pin_context, &token) else {
             warn!("failed to log in to {}", token.name());
             return ResultResponse::error(responses::GetCertificatesErrorCode::GenericError);
         };
@@ -264,12 +270,14 @@ impl Server {
         session: &Session,
         request: requests::GetSignedXml,
     ) -> ResultResponse<responses::GetSignedXml, responses::GetSignedXmlErrorCode> {
+        let (ref nss, ref xmlsec) = *self.nss_xmlsec;
+
         let cert = session.certs.get(request.certificate.alias);
         let Some((token_uri, der, cert_label)) = cert else {
             return ResultResponse::error(responses::GetSignedXmlErrorCode::GenericError);
         };
 
-        let Some(token) = self.nss.get_token(token_uri) else {
+        let Some(token) = nss.get_token(token_uri) else {
             return ResultResponse::error(responses::GetSignedXmlErrorCode::GenericError);
         };
 
@@ -288,12 +296,12 @@ impl Server {
         info!("signature request: {}: {}", cert_label, reason);
         {
             let pin_context = self.get_pin_context(Some(cert_label.clone()), reason);
-            let Ok(_logout_guard) = self.nss.authenticate(&pin_context, &token) else {
+            let Ok(_logout_guard) = nss.authenticate(&pin_context, &token) else {
                 warn!("failed to log in to {}", token.name());
                 return ResultResponse::error(responses::GetSignedXmlErrorCode::GenericError);
             };
 
-            let Ok(signer) = XmlSigner::with_cert(&self.xmlsec, der) else {
+            let Ok(signer) = XmlSigner::with_cert(xmlsec, der) else {
                 return ResultResponse::error(responses::GetSignedXmlErrorCode::GenericError);
             };
 
